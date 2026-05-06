@@ -5,8 +5,8 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
-`GET /api/search` 并发请求 Reverb 与 Digimart；Digimart 失败不影响 Reverb。
-返回统一结构：title / image / price_usd / price_cny / source / url / condition（汇率来自 Frankfurter）。
+`GET /api/search` 并发请求 Reverb、Digimart 与 GuitarGuitar（Pre-Owned）；单方失败返回空列表，不影响其余平台。
+返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import re
 import traceback
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote_plus, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -69,6 +69,26 @@ DIGIMART_BROWSER_HEADERS = {
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     "Cache-Control": "no-cache",
     "Upgrade-Insecure-Requests": "1",
+}
+
+GUITARGUITAR_ORIGIN = "https://www.guitarguitar.co.uk"
+# 列表页常见每页 40 条；用于 ``has_more`` 启发式
+GUITARGUITAR_FULL_PAGE = 40
+GUITARGUITAR_MAX_PARSE = 40
+GUITARGUITAR_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "Referer": f"{GUITARGUITAR_ORIGIN}/",
+    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    'Sec-Ch-Ua-Platform': '"Windows"',
 }
 
 app = FastAPI(
@@ -125,6 +145,19 @@ async def get_rates_to_cny(client: httpx.AsyncClient, currencies: set[str]) -> d
     tasks = [fetch_cny_rate(client, c) for c in keys]
     values = await asyncio.gather(*tasks)
     return dict(zip(keys, values, strict=True))
+
+
+def _gbp_to_cny_rate(rates_map: dict[str, float]) -> float:
+    """
+    1 GBP → CNY。优先 Frankfurter；缺失时使用环境变量 ``GBP_CNY_RATE``（默认 9.15）。
+    """
+    if "GBP" in rates_map:
+        return rates_map["GBP"]
+    raw = os.getenv("GBP_CNY_RATE", "9.15").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 9.15
 
 
 def _digimart_abs_url(href_or_src: str) -> str:
@@ -213,6 +246,74 @@ def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
 
     condition = _digimart_condition_from_block(block)
     return {"title": title, "image": image, "jpy": jpy, "url": url, "condition": condition}
+
+
+def _guitarguitar_search_url(keyword: str, page: int) -> str:
+    """
+    GuitarGuitar Pre-Owned 搜索 URL。
+
+    分页必须用路径 ``/pre-owned/page-N/``；单独使用 ``?page=N`` 查询参数时列表仍停留在第 1 页。
+    """
+    enc = quote_plus(keyword.strip())
+    if page <= 1:
+        return f"{GUITARGUITAR_ORIGIN}/pre-owned/?Query={enc}"
+    return f"{GUITARGUITAR_ORIGIN}/pre-owned/page-{page}/?Query={enc}"
+
+
+def _parse_gbp_price_text(price_blob: str) -> float | None:
+    """解析列表卡片上的英镑字符串（含 ``£899. 00`` 一类空格）。"""
+    if not price_blob:
+        return None
+    compact = re.sub(r"\s+", "", price_blob.strip())
+    m = re.search(r"£?([\d,]+)\.(\d{2})", compact)
+    if m:
+        whole = m.group(1).replace(",", "")
+        try:
+            return float(f"{whole}.{m.group(2)}")
+        except ValueError:
+            return None
+    digits = re.sub(r"[^\d.]", "", compact)
+    if not digits:
+        return None
+    try:
+        return float(digits)
+    except ValueError:
+        return None
+
+
+def _guitarguitar_anchor_to_raw(anchor: Any) -> dict[str, Any] | None:
+    """单条 ``a.product``（Pre-Owned 列表）→ 标题、图片、英镑价格、链接。"""
+    href = (anchor.get("href") or "").strip()
+    if not href or "/product/" not in href:
+        return None
+
+    ttl = anchor.select_one(".qa-product-list-item-title")
+    if ttl is None:
+        return None
+    title = re.sub(r"\s+", " ", ttl.get_text(" ", strip=True).replace("\xa0", " "))
+
+    price_el = anchor.select_one(".product-main-price")
+    if price_el is None:
+        return None
+    price_gbp = _parse_gbp_price_text(price_el.get_text(" ", strip=True))
+    if price_gbp is None or price_gbp <= 0:
+        return None
+
+    image: str | None = None
+    for img in anchor.select("img"):
+        ds = (img.get("data-src") or "").strip()
+        if ds and "blank" not in ds.casefold():
+            image = urljoin(GUITARGUITAR_ORIGIN, ds)
+            break
+
+    url = urljoin(GUITARGUITAR_ORIGIN, href)
+    return {
+        "title": title,
+        "image": image,
+        "gbp": price_gbp,
+        "url": url,
+        "condition": "二手",
+    }
 
 
 def _reverb_condition_cn(listing: dict[str, Any]) -> str:
@@ -331,6 +432,80 @@ async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
         return []
 
 
+async def scrape_guitarguitar(keyword: str, page: int = 1) -> list[dict[str, Any]]:
+    """
+    异步抓取 GuitarGuitar Pre-Owned 搜索列表（与站点 HTML ``a.product`` 解析一致）。
+
+    异常或超时返回空列表，不向外抛错。
+    """
+    q = keyword.strip()
+    if not q:
+        logger.info("[GuitarGuitar] scrape skipped (empty keyword)")
+        return []
+
+    pg = max(1, int(page))
+    url = _guitarguitar_search_url(q, pg)
+    logger.info("[GuitarGuitar] scrape start keyword=%r page=%s url=%s", q, pg, url)
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            r = await client.get(url, headers=GUITARGUITAR_BROWSER_HEADERS)
+            r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        blocks = soup.select(".product-list-products a.product")
+        out: list[dict[str, Any]] = []
+        for anchor in blocks[:GUITARGUITAR_MAX_PARSE]:
+            raw = _guitarguitar_anchor_to_raw(anchor)
+            if raw is not None:
+                out.append(raw)
+
+        logger.info(
+            "[GuitarGuitar] scrape success keyword=%r page=%s parsed_items=%s",
+            q,
+            pg,
+            len(out),
+        )
+        if not out and len(r.text or "") > 500:
+            logger.warning(
+                "[GuitarGuitar] zero parsed items but large HTML (%s bytes) — "
+                "likely layout/selector mismatch or blocking page",
+                len(r.text),
+            )
+        return out
+    except Exception as e:
+        line = (
+            f"[GuitarGuitar] scrape_guitarguitar error | keyword={q!r} page={pg} | "
+            f"type={type(e).__name__} | details={str(e)}"
+        )
+        print(line, flush=True)
+        logger.error(line, exc_info=True)
+        if isinstance(e, httpx.HTTPStatusError):
+            resp = e.response
+            if resp is not None:
+                snippet = (resp.text or "")[:500].replace("\n", " ")
+                detail = (
+                    f"[GuitarGuitar] HTTPStatusError status_code={resp.status_code} "
+                    f"url={resp.url} body_snippet={snippet!r}"
+                )
+                print(detail, flush=True)
+                logger.error(detail)
+        elif isinstance(e, httpx.TimeoutException):
+            detail = (
+                f"[GuitarGuitar] Timeout {type(e).__name__}: "
+                "可调大 timeout 或检查出站网络"
+            )
+            print(detail, flush=True)
+            logger.error(detail)
+        elif isinstance(e, httpx.RequestError):
+            detail = f"[GuitarGuitar] RequestError (连接/TLS/DNS 等): {e!r}"
+            print(detail, flush=True)
+            logger.error(detail)
+        tb = traceback.format_exc()
+        print(f"[GuitarGuitar] full traceback:\n{tb}", flush=True)
+        return []
+
+
 def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
     """Reverb HAL listing 的 ``price`` 对象 → 金额与 ISO 货币。"""
     price_obj = listing.get("price")
@@ -361,6 +536,24 @@ async def _fetch_reverb_listings(query: str, page: int = 1) -> list[dict[str, An
     )
 
 
+async def _safe_fetch_reverb_listings_for_merge(query: str, page: int = 1) -> list[dict[str, Any]]:
+    """供 ``/api/search`` 合并结果使用：Reverb 异常时返回空列表，不阻断其他平台。"""
+    q = query.strip()
+    if not q:
+        return []
+    pg = max(1, int(page))
+    try:
+        return await _fetch_reverb_listings(q, pg)
+    except Exception as e:
+        line = (
+            f"[Reverb] merge fetch failed | query={q!r} page={pg} | "
+            f"type={type(e).__name__} | details={str(e)}"
+        )
+        logger.error(line, exc_info=True)
+        print(line, flush=True)
+        return []
+
+
 def _unified_row(
     *,
     title: str,
@@ -386,7 +579,7 @@ def _unified_row(
 
 
 def _normalize_url_for_dedup(url: str) -> str:
-    """合并 Reverb / Digimart 时按 URL 去重用的规范化键（scheme/host 小写、去尾斜杠）。"""
+    """合并 Reverb / Digimart / GuitarGuitar 时按 URL 去重用的规范化键（scheme/host 小写、去尾斜杠）。"""
     raw = (url or "").strip()
     if not raw:
         return ""
@@ -470,21 +663,21 @@ async def search_reverb(
 
 @app.get("/api/search")
 async def api_search(
-    q: str = Query("", description="搜索关键词；并发查询 Reverb API 与 Digimart"),
-    page: int = Query(1, ge=1, description="页码，从 1 开始；Reverb 与 Digimart 使用同一页码"),
+    q: str = Query("", description="搜索关键词；并发查询 Reverb、Digimart、GuitarGuitar"),
+    page: int = Query(1, ge=1, description="页码，从 1 开始；三方使用同一页码参数"),
 ) -> dict[str, Any]:
     """
-    ``asyncio.gather`` 并发：Reverb（需 ``REVERB_TOKEN``）与 ``scrape_digimart``。
-    Digimart 异常已吞掉；Reverb 仍按原 API 报错规则抛出。
+    ``asyncio.gather`` 并发：``_safe_fetch_reverb_listings_for_merge``、``scrape_digimart``、
+    ``scrape_guitarguitar``。Reverb / Digimart / GuitarGuitar 任一失败时该源返回空列表，
+    不阻断其它平台；合并结果按规范化 ``url`` 去重。
 
-    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` / ``url`` / ``condition``（``全新`` 或 ``二手``）。
-    合并后按规范化 ``url`` 去重，避免同一页内重复条目。
+    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
+    ``url`` / ``condition``（``全新`` 或 ``二手``；GuitarGuitar Pre-Owned 均为 ``二手``）。
 
-    Digimart 仅在第 1 页抓取（其 SSR 对 GET 往往不随页码切换列表，会导致多页重复）；
-    ``has_more`` 在第 2 页及以后仅由 Reverb 是否满页决定。
+    Digimart 仅在第 1 页抓取（避免 SSR 多页重复）；GuitarGuitar 使用路径分页 ``/pre-owned/page-N/``。
 
-    响应含 ``page``、``has_more``。
-    汇价：Frankfurter（``amount * (1 单位外币→CNY)``）；``price_usd`` = ``price_cny / (1 USD→CNY)``。
+    汇价：Frankfurter；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
+    ``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
     q_clean = q.strip()
     if not q_clean:
@@ -492,14 +685,15 @@ async def api_search(
 
     page_no = max(1, page)
     logger.info(
-        "[api/search] start concurrent Reverb+Digimart query=%r page=%s",
+        "[api/search] start concurrent Reverb+Digimart+GuitarGuitar query=%r page=%s",
         q_clean,
         page_no,
     )
 
-    rev_out, digi_out = await asyncio.gather(
-        _fetch_reverb_listings(q_clean, page_no),
+    rev_out, digi_out, gg_out = await asyncio.gather(
+        _safe_fetch_reverb_listings_for_merge(q_clean, page_no),
         scrape_digimart(q_clean, page_no),
+        scrape_guitarguitar(q_clean, page_no),
         return_exceptions=True,
     )
 
@@ -513,32 +707,38 @@ async def api_search(
                 else None
             ),
         )
+    if not isinstance(gg_out, list):
+        logger.error(
+            "[api/search] GuitarGuitar task returned non-list (unexpected): %r",
+            gg_out,
+            exc_info=(
+                (type(gg_out), gg_out, gg_out.__traceback__)
+                if isinstance(gg_out, BaseException)
+                else None
+            ),
+        )
+
     digi_raw: list[dict[str, Any]] = digi_out if isinstance(digi_out, list) else []
+    gg_raw: list[dict[str, Any]] = gg_out if isinstance(gg_out, list) else []
 
-    if isinstance(rev_out, Exception):
-        if isinstance(rev_out, httpx.HTTPStatusError):
-            detail = rev_out.response.text[:500] if rev_out.response else str(rev_out)
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Reverb API 返回 "
-                    f"{rev_out.response.status_code if rev_out.response else '?'}: {detail}"
-                ),
-            ) from rev_out
-        if isinstance(rev_out, httpx.HTTPError):
-            raise HTTPException(
-                status_code=502,
-                detail=f"请求 Reverb 失败: {rev_out}",
-            ) from rev_out
-        raise rev_out
+    if not isinstance(rev_out, list):
+        if isinstance(rev_out, BaseException):
+            logger.error(
+                "[api/search] Reverb task raised unexpectedly (should be empty list): %r",
+                rev_out,
+                exc_info=(type(rev_out), rev_out, rev_out.__traceback__),
+            )
+        raw_rev: list[dict[str, Any]] = []
+    else:
+        raw_rev = rev_out
 
-    raw_rev = rev_out
-
-    if not raw_rev and not digi_raw:
+    if not raw_rev and not digi_raw and not gg_raw:
         return {"query": q_clean, "page": page_no, "has_more": False, "results": []}
 
-    has_more = (len(raw_rev) >= REVERB_PER_PAGE) or (
-        page_no == 1 and len(digi_raw) >= DIGIMART_PER_PAGE
+    has_more = (
+        (len(raw_rev) >= REVERB_PER_PAGE)
+        or (page_no == 1 and len(digi_raw) >= DIGIMART_PER_PAGE)
+        or (len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
     )
 
     currencies: set[str] = {"USD"}
@@ -548,6 +748,8 @@ async def api_search(
             currencies.add(cur)
     if digi_raw:
         currencies.add("JPY")
+    if gg_raw:
+        currencies.add("GBP")
 
     async with httpx.AsyncClient(timeout=20.0) as fx_client:
         try:
@@ -605,6 +807,22 @@ async def api_search(
             )
         )
 
+    gbp_rate = _gbp_to_cny_rate(rates_map)
+    for g in gg_raw:
+        gbp_amt = float(g["gbp"])
+        pcny_gg = gbp_amt * gbp_rate
+        results.append(
+            _unified_row(
+                title=str(g["title"]),
+                image=g.get("image"),
+                url=str(g["url"]),
+                source="GuitarGuitar",
+                price_cny=pcny_gg,
+                usd_to_cny=usd_to_cny,
+                condition="二手",
+            )
+        )
+
     before_dedupe = len(results)
     results = _dedupe_results_preserve_order(results)
     if before_dedupe > len(results):
@@ -616,13 +834,15 @@ async def api_search(
 
     n_rev = sum(1 for row in results if row.get("source") == "Reverb")
     n_dig = sum(1 for row in results if row.get("source") == "Digimart")
+    n_gg = sum(1 for row in results if row.get("source") == "GuitarGuitar")
     logger.info(
-        "[api/search] done query=%r page=%s total=%s (reverb=%s digimart=%s) has_more=%s",
+        "[api/search] done query=%r page=%s total=%s (reverb=%s digimart=%s guitarguitar=%s) has_more=%s",
         q_clean,
         page_no,
         len(results),
         n_rev,
         n_dig,
+        n_gg,
         has_more,
     )
 
