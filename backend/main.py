@@ -18,6 +18,7 @@ import re
 import traceback
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -236,7 +237,14 @@ def _reverb_condition_cn(listing: dict[str, Any]) -> str:
 async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
     异步抓取 Digimart 搜索页（与 ``test_digimart.py`` 同源解析逻辑）。
-    分页：查询参数 ``currentPageNo``（1-based，与站点一致）。
+
+    分页说明：Digimart 搜索页对服务端 GET 往往**只渲染第 1 页** HTML；即使用
+    ``currentPageNo`` / ``page`` 传参，列表内容仍可能与第 1 页相同。若在第 2 页及以后
+    继续抓取，会导致各页出现**同一批 Digimart 商品**，与 Reverb 真分页叠在一起形成
+    「分页重复」。因此 **page > 1 时不再请求 Digimart**，仅保留 Reverb 分页结果。
+
+    第 1 页请求同时携带 ``currentPageNo`` 与 ``page``（站点不同入口可能认其中一种）。
+
     网络/HTML 异常时返回空列表，不向外抛错，避免拖累 Reverb。
     """
     q = keyword.strip()
@@ -245,9 +253,16 @@ async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
         return []
 
     pg = max(1, int(page))
+    if pg > 1:
+        logger.info(
+            "[Digimart] skip scrape for page=%s (SSR 仅首屏列表；避免与第 1 页重复)",
+            pg,
+        )
+        return []
+
     logger.info("[Digimart] scrape start keyword=%r page=%s", q, pg)
     try:
-        params: dict[str, Any] = {"keyword": q, "currentPageNo": pg}
+        params: dict[str, Any] = {"keyword": q, "currentPageNo": pg, "page": pg}
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(
                 DIGIMART_SEARCH,
@@ -370,6 +385,36 @@ def _unified_row(
     }
 
 
+def _normalize_url_for_dedup(url: str) -> str:
+    """合并 Reverb / Digimart 时按 URL 去重用的规范化键（scheme/host 小写、去尾斜杠）。"""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = (parsed.path or "").rstrip("/")
+    if not path:
+        path = "/"
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
+def _dedupe_results_preserve_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一响应内按 ``url`` 去重，保留首次出现顺序；无 URL 的条目不去重。"""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        key = _normalize_url_for_dedup(str(row.get("url") or ""))
+        if not key:
+            out.append(row)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -433,7 +478,12 @@ async def api_search(
     Digimart 异常已吞掉；Reverb 仍按原 API 报错规则抛出。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` / ``url`` / ``condition``（``全新`` 或 ``二手``）。
-    响应含 ``page``、``has_more``（任一侧满页则视为可能还有下一页）。
+    合并后按规范化 ``url`` 去重，避免同一页内重复条目。
+
+    Digimart 仅在第 1 页抓取（其 SSR 对 GET 往往不随页码切换列表，会导致多页重复）；
+    ``has_more`` 在第 2 页及以后仅由 Reverb 是否满页决定。
+
+    响应含 ``page``、``has_more``。
     汇价：Frankfurter（``amount * (1 单位外币→CNY)``）；``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
     q_clean = q.strip()
@@ -487,7 +537,9 @@ async def api_search(
     if not raw_rev and not digi_raw:
         return {"query": q_clean, "page": page_no, "has_more": False, "results": []}
 
-    has_more = (len(raw_rev) >= REVERB_PER_PAGE) or (len(digi_raw) >= DIGIMART_PER_PAGE)
+    has_more = (len(raw_rev) >= REVERB_PER_PAGE) or (
+        page_no == 1 and len(digi_raw) >= DIGIMART_PER_PAGE
+    )
 
     currencies: set[str] = {"USD"}
     for listing in raw_rev:
@@ -551,6 +603,15 @@ async def api_search(
                 usd_to_cny=usd_to_cny,
                 condition=digi_condition,
             )
+        )
+
+    before_dedupe = len(results)
+    results = _dedupe_results_preserve_order(results)
+    if before_dedupe > len(results):
+        logger.info(
+            "[api/search] deduped by url: %s -> %s rows",
+            before_dedupe,
+            len(results),
         )
 
     n_rev = sum(1 for row in results if row.get("source") == "Reverb")

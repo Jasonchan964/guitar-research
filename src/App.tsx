@@ -314,6 +314,35 @@ function PaginationBar({ currentPage, hasMore, loading, onPageChange }: Paginati
   )
 }
 
+function ResultsGridSkeleton() {
+  const placeholders = Array.from({ length: 8 }, (_, i) => i)
+  return (
+    <section className="mt-4" aria-busy="true" aria-live="polite" aria-label="正在加载搜索结果">
+      <p className="mb-4 text-center text-sm font-medium text-slate-500 dark:text-slate-400">
+        加载中…
+      </p>
+      <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
+        {placeholders.map((i) => (
+          <li key={i} className="min-w-0">
+            <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200/90 bg-white dark:border-slate-700/90 dark:bg-slate-900 md:rounded-2xl">
+              <div className="aspect-[4/3] w-full animate-pulse bg-slate-200/90 dark:bg-slate-800" />
+              <div className="flex flex-1 flex-col gap-2 p-3 sm:gap-2.5 sm:p-4 md:p-5">
+                <div className="h-3.5 w-full animate-pulse rounded bg-slate-200/90 dark:bg-slate-800" />
+                <div className="h-3.5 w-[88%] animate-pulse rounded bg-slate-200/90 dark:bg-slate-800" />
+                <div className="flex flex-wrap gap-1.5 pt-0.5">
+                  <div className="h-5 w-14 animate-pulse rounded-full bg-slate-200/90 dark:bg-slate-800" />
+                  <div className="h-5 w-12 animate-pulse rounded-full bg-slate-200/90 dark:bg-slate-800" />
+                </div>
+                <div className="mt-1 h-4 w-24 animate-pulse rounded bg-slate-200/90 dark:bg-slate-800" />
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
 function SearchCluster({
   compact,
   query,
@@ -428,6 +457,7 @@ function App() {
     const trimmed = q.trim()
     if (!trimmed) return
 
+    setListings([])
     setLoading(true)
     setError(null)
 
@@ -473,6 +503,7 @@ function App() {
   const handlePageChange = (page: number) => {
     if (!submittedQuery || page < 1 || loading) return
     if (page === currentPage) return
+    setCurrentPage(page)
     void fetchSearchPage(submittedQuery, page)
   }
 
@@ -581,7 +612,9 @@ function App() {
             </p>
           )}
 
-          {listings.length > 0 && (
+          {loading && !error && <ResultsGridSkeleton />}
+
+          {!loading && listings.length > 0 && (
             <section className="mt-4" aria-label="搜索结果">
               <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
                 {displayedListings.map((item, index) => (
