@@ -5,16 +5,20 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
+`GET /api/search` 并发请求 Reverb 与 Digimart；Digimart 失败不影响 Reverb。
+返回统一结构：title / image / price_usd / price_cny / source / url（汇率来自 Frankfurter）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 import httpx
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -24,71 +28,35 @@ from env_load import load_project_dotenv
 load_project_dotenv()
 
 from exchange_rate_cache import get_usd_cny_rate_cached
-from reverb_client import listing_to_search_item, search_reverb_listings_async
+from reverb_client import (
+    extract_first_photo_url,
+    extract_listing_web_url,
+    listing_to_search_item,
+    search_reverb_listings_async,
+)
 
-FRANKFURTER = "https://api.frankfurter.app/latest"
+FRANKFURTER = "https://api.frankfurter.dev/v1/latest"
 
 # 与 Dockerfile 一致：构建产物在仓库根目录的 dist/，由同一进程托管前端（公网单域名）
 DIST_DIR = Path(__file__).resolve().parent.parent / "dist"
 HAS_FRONTEND = (DIST_DIR / "index.html").is_file()
 
-# 假数据：金额 + ISO 货币代码，供汇率换算；原价展示文案给前端直接显示
-RAW_LISTINGS: list[dict[str, Any]] = [
-    {
-        "id": "1",
-        "imageUrl": "https://picsum.photos/seed/guitar1/640/480",
-        "title": "Fender Japan Mustang MG69 / CIJ",
-        "platform": "Digimart",
-        "amount": 168_000.0,
-        "currency": "JPY",
-        "priceOriginal": "¥168,000",
-    },
-    {
-        "id": "2",
-        "imageUrl": "https://picsum.photos/seed/guitar2/640/480",
-        "title": "Fender Mustang Offset 2018",
-        "platform": "Reverb",
-        "amount": 1249.0,
-        "currency": "USD",
-        "priceOriginal": "$1,249 USD",
-    },
-    {
-        "id": "3",
-        "imageUrl": "https://picsum.photos/seed/guitar3/640/480",
-        "title": "Squier Classic Vibe Mustang",
-        "platform": "Reverb",
-        "amount": 429.0,
-        "currency": "USD",
-        "priceOriginal": "$429 USD",
-    },
-    {
-        "id": "4",
-        "imageUrl": "https://picsum.photos/seed/guitar4/640/480",
-        "title": "Fender MIJ Mustang Bass",
-        "platform": "Digimart",
-        "amount": 142_000.0,
-        "currency": "JPY",
-        "priceOriginal": "¥142,000",
-    },
-    {
-        "id": "5",
-        "imageUrl": "https://picsum.photos/seed/guitar5/640/480",
-        "title": "Offset Mustang Shell Pink",
-        "platform": "Reverb",
-        "amount": 980.0,
-        "currency": "EUR",
-        "priceOriginal": "€980 EUR",
-    },
-    {
-        "id": "6",
-        "imageUrl": "https://picsum.photos/seed/guitar6/640/480",
-        "title": "Mustang 短弦长 改装拾音器",
-        "platform": "Digimart",
-        "amount": 198_000.0,
-        "currency": "JPY",
-        "priceOriginal": "¥198,000",
-    },
-]
+DIGIMART_ORIGIN = "https://www.digimart.net"
+DIGIMART_SEARCH = f"{DIGIMART_ORIGIN}/search"
+# 常见桌面 Chrome UA，降低被站点拒绝的概率（仍需遵守对方 robots/条款）
+DIGIMART_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 app = FastAPI(
     title="Guitar Search API",
@@ -122,7 +90,11 @@ async def fetch_cny_rate(client: httpx.AsyncClient, currency: str) -> float:
     """返回 1 单位 `currency` 等于多少 CNY。"""
     if currency == "CNY":
         return 1.0
-    r = await client.get(FRANKFURTER, params={"from": currency, "to": "CNY"})
+    r = await client.get(
+        FRANKFURTER,
+        params={"from": currency, "to": "CNY"},
+        follow_redirects=True,
+    )
     r.raise_for_status()
     data = r.json()
     try:
@@ -132,11 +104,141 @@ async def fetch_cny_rate(client: httpx.AsyncClient, currency: str) -> float:
 
 
 async def get_rates_to_cny(client: httpx.AsyncClient, currencies: set[str]) -> dict[str, float]:
+    currencies = set(currencies)
     currencies.discard("CNY")
-    tasks = [fetch_cny_rate(client, c) for c in sorted(currencies)]
+    if not currencies:
+        return {}
     keys = sorted(currencies)
+    tasks = [fetch_cny_rate(client, c) for c in keys]
     values = await asyncio.gather(*tasks)
     return dict(zip(keys, values, strict=True))
+
+
+def _digimart_abs_url(href_or_src: str) -> str:
+    s = (href_or_src or "").strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    if s.startswith("//"):
+        return f"https:{s}"
+    if s.startswith("/"):
+        return f"{DIGIMART_ORIGIN}{s}"
+    return f"{DIGIMART_ORIGIN}/{s}"
+
+
+def _parse_jpy_amount(text: str) -> int | None:
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return None
+    try:
+        n = int(digits)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
+    """单条 Digimart ``.itemSearchListItem`` → 标题、图片、日元整数、链接。"""
+    ttl = block.select_one("p.ttl a")
+    if ttl is None:
+        return None
+    href = (ttl.get("href") or "").strip()
+    if not href:
+        return None
+    title = re.sub(r"\s+", " ", ttl.get_text(strip=True).replace("\xa0", " "))
+    url = _digimart_abs_url(href)
+
+    img = block.select_one(".pic img")
+    src = (img.get("src") or "").strip() if img is not None else ""
+    image: str | None = _digimart_abs_url(src) if src else None
+
+    jpy: int | None = None
+    state = block.select_one(".itemState")
+    if state is not None:
+        for price_el in state.select("p.price"):
+            n = _parse_jpy_amount(price_el.get_text(" ", strip=True))
+            if n is not None:
+                jpy = n
+                break
+    if jpy is None:
+        return None
+
+    return {"title": title, "image": image, "jpy": jpy, "url": url}
+
+
+async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
+    """
+    异步抓取 Digimart 搜索页（与 ``test_digimart.py`` 同源解析逻辑）。
+    网络/HTML 异常时返回空列表，不向外抛错，避免拖累 Reverb。
+    """
+    q = keyword.strip()
+    if not q:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.get(
+                DIGIMART_SEARCH,
+                params={"keyword": q},
+                headers=DIGIMART_BROWSER_HEADERS,
+            )
+            r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        out: list[dict[str, Any]] = []
+        for block in soup.select(".itemSearchListItem"):
+            item = _digimart_block_to_raw(block)
+            if item is not None:
+                out.append(item)
+        return out
+    except Exception:
+        return []
+
+
+def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
+    """Reverb HAL listing 的 ``price`` 对象 → 金额与 ISO 货币。"""
+    price_obj = listing.get("price")
+    if not isinstance(price_obj, dict):
+        return None, None
+    raw_amt = price_obj.get("amount")
+    if raw_amt is None:
+        return None, None
+    try:
+        amt = float(raw_amt)
+    except (TypeError, ValueError):
+        return None, None
+    cur = price_obj.get("currency") or price_obj.get("currency_iso") or ""
+    c = str(cur).strip().upper()
+    return amt, c if c else None
+
+
+async def _fetch_reverb_listings(query: str) -> list[dict[str, Any]]:
+    token = os.environ.get("REVERB_TOKEN", "").strip()
+    if not token:
+        return []
+    return await search_reverb_listings_async(token, query)
+
+
+def _unified_row(
+    *,
+    title: str,
+    image: str | None,
+    url: str,
+    source: str,
+    price_cny: float | None,
+    usd_to_cny: float,
+) -> dict[str, Any]:
+    price_usd: float | None = None
+    if price_cny is not None and usd_to_cny > 0:
+        price_usd = round(price_cny / usd_to_cny, 2)
+    return {
+        "title": title,
+        "image": image,
+        "price_usd": price_usd,
+        "price_cny": round(price_cny, 2) if price_cny is not None else None,
+        "source": source,
+        "url": url,
+    }
 
 
 @app.get("/api/health")
@@ -193,52 +295,110 @@ async def search_reverb(
 
 
 @app.get("/api/search")
-async def search(q: str = Query("", description="型号关键词，匹配标题（不区分大小写）")) -> dict[str, Any]:
-    q_norm = q.strip().lower()
-    filtered = (
-        [x for x in RAW_LISTINGS if q_norm in x["title"].lower()]
-        if q_norm
-        else list(RAW_LISTINGS)
+async def api_search(
+    q: str = Query("", description="搜索关键词；并发查询 Reverb API 与 Digimart"),
+) -> dict[str, Any]:
+    """
+    ``asyncio.gather`` 并发：Reverb（需 ``REVERB_TOKEN``）与 ``scrape_digimart``。
+    Digimart 异常已吞掉；Reverb 仍按原 API 报错规则抛出。
+
+    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` / ``url``。
+    汇价：Frankfurter（``amount * (1 单位外币→CNY)``）；``price_usd`` = ``price_cny / (1 USD→CNY)``。
+    """
+    q_clean = q.strip()
+    if not q_clean:
+        return {"query": "", "results": []}
+
+    rev_out, digi_out = await asyncio.gather(
+        _fetch_reverb_listings(q_clean),
+        scrape_digimart(q_clean),
+        return_exceptions=True,
     )
 
-    if not filtered:
-        return {
-            "query": q.strip(),
-            "listings": [],
-            "fxNote": "没有匹配的条目；未请求汇率。",
-        }
+    digi_raw: list[dict[str, Any]] = [] if isinstance(digi_out, Exception) else digi_out
 
-    currencies = {row["currency"] for row in filtered}
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    if isinstance(rev_out, Exception):
+        if isinstance(rev_out, httpx.HTTPStatusError):
+            detail = rev_out.response.text[:500] if rev_out.response else str(rev_out)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Reverb API 返回 "
+                    f"{rev_out.response.status_code if rev_out.response else '?'}: {detail}"
+                ),
+            ) from rev_out
+        if isinstance(rev_out, httpx.HTTPError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"请求 Reverb 失败: {rev_out}",
+            ) from rev_out
+        raise rev_out
+
+    raw_rev = rev_out
+
+    if not raw_rev and not digi_raw:
+        return {"query": q_clean, "results": []}
+
+    currencies: set[str] = {"USD"}
+    for listing in raw_rev:
+        _, cur = _reverb_amount_currency(listing)
+        if cur:
+            currencies.add(cur)
+    if digi_raw:
+        currencies.add("JPY")
+
+    async with httpx.AsyncClient(timeout=20.0) as fx_client:
         try:
-            rates = await get_rates_to_cny(client, currencies)
+            rates_map = await get_rates_to_cny(fx_client, currencies)
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"请求汇率服务失败: {e}") from e
 
-    listings: list[dict[str, Any]] = []
-    for row in filtered:
-        cur = row["currency"]
-        rate = 1.0 if cur == "CNY" else rates[cur]
-        cny = row["amount"] * rate
-        listings.append(
-            {
-                "id": row["id"],
-                "imageUrl": row["imageUrl"],
-                "title": row["title"],
-                "platform": row["platform"],
-                "priceOriginal": row["priceOriginal"],
-                "priceTarget": f"约 ¥{cny:,.2f}",
-                "priceTargetCny": round(cny, 2),
-                "fxRateUsed": rate,
-                "fxFromCurrency": cur,
-            }
+    try:
+        usd_to_cny = rates_map["USD"]
+    except KeyError as e:
+        raise HTTPException(status_code=502, detail="汇率结果缺少 USD→CNY") from e
+
+    results: list[dict[str, Any]] = []
+
+    for listing in raw_rev:
+        title = str(listing.get("title") or listing.get("name") or "")
+        image = extract_first_photo_url(listing)
+        url = extract_listing_web_url(listing)
+        amt, cur = _reverb_amount_currency(listing)
+        price_cny: float | None = None
+        if amt is not None and cur:
+            if cur == "CNY":
+                price_cny = amt
+            elif cur in rates_map:
+                price_cny = amt * rates_map[cur]
+        results.append(
+            _unified_row(
+                title=title,
+                image=image,
+                url=url,
+                source="Reverb",
+                price_cny=price_cny,
+                usd_to_cny=usd_to_cny,
+            )
         )
 
-    return {
-        "query": q.strip(),
-        "listings": listings,
-        "fxNote": "汇率来自 Frankfurter（ECB），工作日更新，仅供参考。",
-    }
+    for d in digi_raw:
+        jpy_amt = int(d["jpy"])
+        pcny: float | None = None
+        if "JPY" in rates_map:
+            pcny = jpy_amt * rates_map["JPY"]
+        results.append(
+            _unified_row(
+                title=str(d["title"]),
+                image=d.get("image"),
+                url=str(d["url"]),
+                source="Digimart",
+                price_cny=pcny,
+                usd_to_cny=usd_to_cny,
+            )
+        )
+
+    return {"query": q_clean, "results": results}
 
 
 if HAS_FRONTEND:
