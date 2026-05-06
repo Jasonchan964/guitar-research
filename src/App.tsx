@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
+import { Search } from 'lucide-react'
 import type { ReverbListing, ReverbSearchApiResponse } from './mockGuitars'
 
 const PLACEHOLDER_IMG =
   'data:image/svg+xml,' +
   encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect fill="#e4e4e7" width="640" height="480"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#71717a" font-family="system-ui" font-size="18">No image</text></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect fill="#f1f5f9" width="640" height="480"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="system-ui" font-size="18">No image</text></svg>',
   )
 
 /** 解析 Reverb `1234.56 USD` */
@@ -33,19 +34,19 @@ function formatCnyPretty(amountUsd: number, rate: number): string {
 type CurrencyToggleProps = {
   currency: 'USD' | 'CNY'
   onChange: (c: 'USD' | 'CNY') => void
+  compact?: boolean
 }
 
-/** iOS 风格滑动开关：USD $ / CNY ¥ */
-function CurrencyToggle({ currency, onChange }: CurrencyToggleProps) {
+function CurrencyToggle({ currency, onChange, compact }: CurrencyToggleProps) {
   const isCny = currency === 'CNY'
 
   return (
     <div
-      className="flex flex-col items-end gap-1"
+      className={`flex flex-col items-end gap-1 ${compact ? 'scale-95' : ''}`}
       role="group"
       aria-label="标价货币"
     >
-      <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+      <span className="text-[10px] font-medium uppercase tracking-wider text-slate-400">
         标价
       </span>
       <button
@@ -54,24 +55,24 @@ function CurrencyToggle({ currency, onChange }: CurrencyToggleProps) {
         aria-checked={isCny}
         aria-label={isCny ? '当前为人民币，点击切换到美元' : '当前为美元，点击切换到人民币'}
         onClick={() => onChange(isCny ? 'USD' : 'CNY')}
-        className="relative h-11 w-[148px] shrink-0 rounded-[13px] bg-gradient-to-b from-zinc-200 to-zinc-300 p-[3px] shadow-inner ring-1 ring-zinc-400/40 transition-shadow duration-300 hover:ring-zinc-400/60 active:scale-[0.98] dark:from-zinc-700 dark:to-zinc-800 dark:ring-zinc-600/50 dark:hover:ring-zinc-500/60"
+        className="relative h-10 w-[136px] shrink-0 rounded-full border border-slate-200/90 bg-slate-100/90 p-[3px] shadow-sm transition-shadow duration-200 hover:shadow-md dark:border-slate-600 dark:bg-slate-800"
       >
         <span
-          className={`pointer-events-none absolute top-[3px] h-[calc(100%-6px)] w-[calc(50%-6px)] rounded-[10px] bg-white shadow-md ring-1 ring-black/5 transition-[left,box-shadow] duration-300 ease-[cubic-bezier(0.34,1.2,0.64,1)] dark:bg-zinc-950 dark:shadow-black/50 dark:ring-white/10 ${
+          className={`pointer-events-none absolute top-[3px] h-[calc(100%-6px)] w-[calc(50%-6px)] rounded-full bg-white shadow-sm ring-1 ring-slate-200/80 transition-[left] duration-200 ease-out dark:bg-slate-950 dark:ring-slate-700 ${
             isCny ? 'left-[calc(50%+3px)]' : 'left-[3px]'
           }`}
         />
         <span className="relative z-10 flex h-full items-stretch">
           <span
-            className={`flex flex-1 items-center justify-center gap-0.5 text-[11px] font-semibold tracking-tight transition-colors duration-300 ${
-              !isCny ? 'text-zinc-900 dark:text-white' : 'text-zinc-500 dark:text-zinc-500'
+            className={`flex flex-1 items-center justify-center gap-0.5 text-[11px] font-semibold tracking-tight ${
+              !isCny ? 'text-slate-900 dark:text-slate-100' : 'text-slate-500'
             }`}
           >
             USD <span className="text-xs opacity-80">$</span>
           </span>
           <span
-            className={`flex flex-1 items-center justify-center gap-0.5 text-[11px] font-semibold tracking-tight transition-colors duration-300 ${
-              isCny ? 'text-zinc-900 dark:text-white' : 'text-zinc-500 dark:text-zinc-500'
+            className={`flex flex-1 items-center justify-center gap-0.5 text-[11px] font-semibold tracking-tight ${
+              isCny ? 'text-slate-900 dark:text-slate-100' : 'text-slate-500'
             }`}
           >
             CNY <span className="text-xs opacity-80">¥</span>
@@ -89,7 +90,6 @@ type PriceCrossfadeProps = {
   rateReady: boolean
 }
 
-/** 双图层交叉淡入淡出，避免数字跳变闪烁 */
 function PriceCrossfade({ rawPrice, currency, rate, rateReady }: PriceCrossfadeProps) {
   const amount = parseUsdAmount(rawPrice)
   const isUsdLike = amount != null
@@ -104,7 +104,7 @@ function PriceCrossfade({ rawPrice, currency, rate, rateReady }: PriceCrossfadeP
   return (
     <span className="relative inline-grid min-h-[1.35em] place-items-start">
       <span
-        className={`col-start-1 row-start-1 font-semibold tabular-nums tracking-tight text-emerald-600 transition-[opacity,transform] duration-300 ease-out dark:text-emerald-400 ${
+        className={`col-start-1 row-start-1 font-semibold tabular-nums tracking-tight text-emerald-700 transition-[opacity,transform] duration-200 ease-out dark:text-emerald-400 ${
           showUsd ? 'opacity-100' : 'pointer-events-none opacity-0 [transform:translateY(2px)]'
         }`}
         aria-hidden={!showUsd}
@@ -112,7 +112,7 @@ function PriceCrossfade({ rawPrice, currency, rate, rateReady }: PriceCrossfadeP
         {usdLine}
       </span>
       <span
-        className={`col-start-1 row-start-1 font-semibold tabular-nums tracking-tight text-emerald-600 transition-[opacity,transform] duration-300 ease-out dark:text-emerald-400 ${
+        className={`col-start-1 row-start-1 font-semibold tabular-nums tracking-tight text-emerald-700 transition-[opacity,transform] duration-200 ease-out dark:text-emerald-400 ${
           showCny ? 'opacity-100' : 'pointer-events-none opacity-0 [transform:translateY(-2px)]'
         }`}
         aria-hidden={!showCny}
@@ -120,6 +120,76 @@ function PriceCrossfade({ rawPrice, currency, rate, rateReady }: PriceCrossfadeP
         {cnyLine ?? usdLine}
       </span>
     </span>
+  )
+}
+
+type SearchClusterProps = {
+  compact?: boolean
+  query: string
+  setQuery: (q: string) => void
+  loading: boolean
+  onSubmitSearch: () => void
+}
+
+function SearchCluster({
+  compact,
+  query,
+  setQuery,
+  loading,
+  onSubmitSearch,
+}: SearchClusterProps) {
+  const py = compact ? 'py-2.5 pl-11 pr-4' : 'py-3 pl-12 pr-5'
+  const iconSize = compact ? 'h-4 w-4' : 'h-[1.125rem] w-[1.125rem]'
+  const iconLeft = compact ? 'left-3.5' : 'left-4'
+
+  return (
+    <div className={`mx-auto w-full ${compact ? 'max-w-2xl' : 'max-w-[min(100%,36rem)]'}`}>
+      <form
+        className="flex flex-col items-stretch gap-6"
+        onSubmit={(e) => {
+          e.preventDefault()
+          onSubmitSearch()
+        }}
+      >
+        <label className="sr-only" htmlFor={compact ? 'search-compact' : 'search-main'}>
+          搜索吉他
+        </label>
+        {/* Google 风格：整条输入条随 hover / focus 柔和升降投影 */}
+        <div
+          className={`group relative flex w-full items-center rounded-full border border-slate-200/90 bg-white shadow-sm transition-all duration-200 ease-out hover:border-slate-300 hover:shadow-md focus-within:border-slate-300 focus-within:shadow-md dark:border-slate-600 dark:bg-slate-900 dark:hover:border-slate-500 dark:focus-within:border-slate-500 ${
+            loading ? 'opacity-80' : ''
+          }`}
+        >
+          <Search
+            className={`pointer-events-none absolute ${iconLeft} top-1/2 ${iconSize} -translate-y-1/2 text-slate-400 transition-colors duration-200 group-focus-within:text-slate-500 dark:text-slate-500`}
+            strokeWidth={2}
+            aria-hidden
+          />
+          <input
+            id={compact ? 'search-compact' : 'search-main'}
+            type="search"
+            autoComplete="off"
+            placeholder="例如：Fender Mustang"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            disabled={loading}
+            className={`min-w-0 flex-1 rounded-full border-0 bg-transparent text-slate-800 outline-none ring-0 transition-colors placeholder:text-slate-400 focus:ring-0 disabled:cursor-not-allowed dark:text-slate-100 dark:placeholder:text-slate-500 ${compact ? 'text-[15px]' : 'text-base sm:text-[17px]'} ${py}`}
+          />
+        </div>
+
+        {/* 单个黑色圆角按钮（Google 系：干净无衬线、适度字重与字距） */}
+        <div className="flex justify-center">
+          <button
+            type="submit"
+            disabled={loading || !query.trim()}
+            className={`inline-flex items-center justify-center rounded-full bg-zinc-950 px-7 text-white shadow-sm ring-1 ring-black/10 transition-[transform,box-shadow,background-color] duration-200 ease-out hover:bg-zinc-900 hover:shadow-md active:scale-[0.98] disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500 disabled:shadow-none disabled:ring-zinc-300/40 ${compact ? 'min-h-[2.25rem] py-2 text-[13px] font-medium leading-none tracking-[0.01em]' : 'min-h-[2.75rem] py-2.5 text-sm font-medium leading-none tracking-[0.01em]'}`}
+            style={{ fontFamily: 'system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif' }}
+          >
+            {loading ? 'Searching…' : 'Search'}
+          </button>
+        </div>
+      </form>
+    </div>
   )
 }
 
@@ -163,16 +233,16 @@ function App() {
 
   const rateReady = !rateLoading && exchangeRate != null && !rateError
 
-  const handleSearch = async () => {
-    const q = query.trim()
-    if (!q) return
+  const runSearchWithQuery = async (q: string) => {
+    const trimmed = q.trim()
+    if (!trimmed) return
 
-    setSubmittedQuery(q)
+    setSubmittedQuery(trimmed)
     setLoading(true)
     setError(null)
 
     try {
-      const res = await fetch(`/search?q=${encodeURIComponent(q)}`)
+      const res = await fetch(`/search?q=${encodeURIComponent(trimmed)}`)
       if (!res.ok) {
         const text = await res.text()
         throw new Error(text || `请求失败 (${res.status})`)
@@ -187,148 +257,162 @@ function App() {
     }
   }
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      void handleSearch()
-    }
+  const handleSubmitSearch = () => {
+    void runSearchWithQuery(query)
   }
 
   const showResults = submittedQuery !== null
 
   return (
-    <div className="min-h-svh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <header className="sticky top-0 z-40 border-b border-zinc-200/80 bg-white/75 px-4 py-3 backdrop-blur-xl dark:border-zinc-800/80 dark:bg-zinc-950/75">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4">
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-medium text-zinc-600 dark:text-zinc-300">
+    <div className="min-h-svh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
+      {!showResults ? (
+        <header className="border-b border-slate-200/60 bg-white/80 px-4 py-3 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/80">
+          <div className="mx-auto flex max-w-5xl items-center justify-end">
+            <CurrencyToggle currency={currency} onChange={setCurrency} />
+          </div>
+        </header>
+      ) : (
+        <header className="sticky top-0 z-40 border-b border-slate-200/70 bg-white/90 px-4 py-3 shadow-sm backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/90">
+          <div className="mx-auto flex max-w-6xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+            <div className="flex shrink-0 items-center justify-between gap-3 sm:block">
+              <p className="text-sm font-medium tracking-tight text-slate-700 dark:text-slate-200">
+                Guitar Search
+              </p>
+              {!rateLoading && rateReady && exchangeRate != null && (
+                <p className="hidden text-[11px] text-slate-400 sm:block dark:text-slate-500">
+                  1 USD ≈ {exchangeRate.toFixed(4)} CNY
+                </p>
+              )}
+              <div className="sm:hidden">
+                <CurrencyToggle currency={currency} onChange={setCurrency} compact />
+              </div>
+            </div>
+            <div className="min-w-0 flex-1">
+              <SearchCluster
+                compact
+                query={query}
+                setQuery={setQuery}
+                loading={loading}
+                onSubmitSearch={handleSubmitSearch}
+              />
+            </div>
+            <div className="hidden shrink-0 sm:block">
+              <CurrencyToggle currency={currency} onChange={setCurrency} compact />
+            </div>
+          </div>
+        </header>
+      )}
+
+      {!showResults ? (
+        <main className="mx-auto flex min-h-[calc(100svh-3.25rem)] max-w-5xl flex-col items-center justify-center px-6 pb-24 pt-8 sm:px-8">
+          <div className="mb-12 text-center">
+            <h1 className="text-5xl font-light tracking-tight text-slate-800 sm:text-6xl dark:text-white">
               Guitar Search
-            </p>
+            </h1>
             {!rateLoading && rateReady && exchangeRate != null && (
-              <p className="mt-0.5 text-[11px] text-zinc-400 transition-opacity duration-300 dark:text-zinc-500">
-                1 USD ≈ {exchangeRate.toFixed(4)} CNY
+              <p className="mt-4 text-[11px] text-slate-400 dark:text-slate-500">
+                参考汇率 1 USD ≈ {exchangeRate.toFixed(4)} CNY
               </p>
             )}
             {rateLoading && (
-              <p className="mt-0.5 h-4 w-32 animate-pulse rounded bg-zinc-200/80 dark:bg-zinc-800/80" />
+              <p className="mx-auto mt-3 h-3 w-36 animate-pulse rounded bg-slate-200/90 dark:bg-slate-800" />
             )}
             {!rateLoading && rateError && (
-              <p className="mt-0.5 text-[11px] text-amber-600 dark:text-amber-400">
+              <p className="mt-3 text-[11px] text-amber-600 dark:text-amber-400">
                 汇率暂不可用，仅显示原价
               </p>
             )}
           </div>
-          <CurrencyToggle currency={currency} onChange={setCurrency} />
-        </div>
-      </header>
-
-      <div
-        className={
-          showResults
-            ? 'mx-auto flex max-w-6xl flex-col px-4 pb-16 pt-8'
-            : 'mx-auto flex min-h-[calc(100svh-4.5rem)] max-w-6xl flex-col justify-center px-4 pb-16 pt-10'
-        }
-      >
-        <div className={showResults ? 'w-full max-w-2xl self-center' : 'w-full max-w-2xl self-center'}>
-          {!showResults && (
-            <h1 className="mb-10 text-center text-4xl font-light tracking-tight text-zinc-800 dark:text-zinc-100 sm:text-5xl">
-              Guitar Search
-            </h1>
-          )}
-          <label className="sr-only" htmlFor="search">
-            搜索吉他
-          </label>
-          <input
-            id="search"
-            type="search"
-            autoComplete="off"
-            placeholder="例如：Fender Mustang"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={handleKeyDown}
-            disabled={loading}
-            className="w-full rounded-full border border-zinc-200 bg-white px-6 py-4 text-lg shadow-sm outline-none ring-zinc-300 transition placeholder:text-zinc-400 focus:border-zinc-300 focus:ring-4 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-900 dark:placeholder:text-zinc-500 dark:focus:border-zinc-600 dark:focus:ring-zinc-700"
+          <SearchCluster
+            query={query}
+            setQuery={setQuery}
+            loading={loading}
+            onSubmitSearch={handleSubmitSearch}
           />
-          {showResults && submittedQuery && (
-            <p className="mt-3 text-center text-sm text-zinc-500 transition-colors duration-300 dark:text-zinc-400">
+        </main>
+      ) : (
+        <main className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
+          {submittedQuery && (
+            <p className="mb-2 text-center text-sm text-slate-500 dark:text-slate-400">
               Reverb 搜索结果 · 「{submittedQuery}」
               {loading && ' · 加载中…'}
             </p>
           )}
           {error && (
-            <p className="mt-3 text-center text-sm text-red-600 dark:text-red-400" role="alert">
+            <p className="mb-6 text-center text-sm text-red-600 dark:text-red-400" role="alert">
               {error}
             </p>
           )}
-          {showResults && !error && (
-            <p className="mt-2 text-center text-xs text-zinc-400 transition-opacity duration-300 dark:text-zinc-500">
+          {!error && (
+            <p className="mb-10 text-center text-xs text-slate-400 dark:text-slate-500">
               USD / CNY 仅对「金额 + USD」标价换算；其它币种显示原价。
             </p>
           )}
-        </div>
 
-        {showResults && !loading && !error && listings.length === 0 && (
-          <p className="mt-10 text-center text-zinc-500 dark:text-zinc-400">
-            没有结果，可换个关键词（例如 <strong>Fender</strong>、<strong>Mustang</strong>）。
-          </p>
-        )}
+          {!loading && !error && listings.length === 0 && (
+            <p className="mt-6 text-center text-slate-600 dark:text-slate-400">
+              没有结果，可换个关键词（例如 <strong className="font-medium">Fender</strong>、
+              <strong className="font-medium">Mustang</strong>）。
+            </p>
+          )}
 
-        {showResults && listings.length > 0 && (
-          <section className="mt-12 w-full" aria-label="搜索结果">
-            <ul className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
-              {listings.map((item, index) => (
-                <li key={item.url ? `${item.url}-${index}` : `row-${index}`}>
-                  <article className="flex h-full flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm transition-[box-shadow,transform] duration-300 ease-out hover:-translate-y-0.5 hover:shadow-md dark:border-zinc-800 dark:bg-zinc-900">
-                    <div className="aspect-[4/3] overflow-hidden bg-zinc-100 dark:bg-zinc-800">
-                      <img
-                        src={item.imageUrl || PLACEHOLDER_IMG}
-                        alt=""
-                        className="h-full w-full object-cover transition-transform duration-500 ease-out hover:scale-[1.02]"
-                        loading="lazy"
-                        width={640}
-                        height={480}
-                      />
-                    </div>
-                    <div className="flex flex-1 flex-col space-y-3 p-4 text-left">
-                      <h2 className="line-clamp-2 text-base font-medium leading-snug text-zinc-900 transition-colors duration-300 dark:text-zinc-100">
-                        {item.title}
-                      </h2>
-                      <p>
-                        <span className="inline-flex rounded-md bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
-                          Reverb
-                        </span>
-                      </p>
-                      <p className="text-sm text-zinc-700 dark:text-zinc-200">
-                        <span className="text-zinc-500 transition-colors duration-300 dark:text-zinc-400">
-                          标价{' '}
-                        </span>
-                        <PriceCrossfade
-                          rawPrice={item.price}
-                          currency={currency}
-                          rate={exchangeRate}
-                          rateReady={rateReady}
+          {listings.length > 0 && (
+            <section className="mt-4" aria-label="搜索结果">
+              <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
+                {listings.map((item, index) => (
+                  <li key={item.url ? `${item.url}-${index}` : `row-${index}`} className="min-w-0">
+                    <article className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200/90 bg-white shadow-sm transition-shadow duration-200 hover:shadow-md md:rounded-2xl dark:border-slate-700/90 dark:bg-slate-900">
+                      <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
+                        <img
+                          src={item.imageUrl || PLACEHOLDER_IMG}
+                          alt=""
+                          className="h-full w-full object-cover object-center"
+                          loading="lazy"
+                          width={640}
+                          height={480}
                         />
-                      </p>
-                      {item.url ? (
-                        <p className="mt-auto pt-1">
-                          <a
-                            href={item.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex text-sm font-medium text-violet-600 underline-offset-2 transition-colors duration-200 hover:underline dark:text-violet-400"
-                          >
-                            前往原网页
-                          </a>
+                      </div>
+                      <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 p-3 text-left sm:gap-2 sm:p-4 md:gap-2.5 md:p-5">
+                        <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
+                          {item.title}
+                        </h2>
+                        <p className="shrink-0">
+                          <span className="inline-flex rounded-full border border-slate-200/80 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600 sm:px-2.5 sm:text-xs dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                            Reverb
+                          </span>
                         </p>
-                      ) : null}
-                    </div>
-                  </article>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-      </div>
+                        <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
+                          <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
+                          <span className="min-w-0 max-w-full sm:whitespace-nowrap">
+                            <PriceCrossfade
+                              rawPrice={item.price}
+                              currency={currency}
+                              rate={exchangeRate}
+                              rateReady={rateReady}
+                            />
+                          </span>
+                        </p>
+                        {item.url ? (
+                          <p className="mt-auto shrink-0 pt-1.5 sm:pt-2">
+                            <a
+                              href={item.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-xs font-medium text-blue-700 underline-offset-2 hover:underline sm:text-sm dark:text-blue-400"
+                            >
+                              前往原网页
+                            </a>
+                          </p>
+                        ) : null}
+                      </div>
+                    </article>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </main>
+      )}
     </div>
   )
 }

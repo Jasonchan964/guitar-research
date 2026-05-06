@@ -157,10 +157,16 @@ async def exchange_rate() -> dict[str, float]:
 
 @app.get("/search")
 async def search_reverb(
-    q: str = Query(..., min_length=1, description="搜索关键词，例如 Fender"),
+    q: str = Query(
+        ...,
+        min_length=1,
+        description="搜索关键词，例如 Fender（前端搜索框输入后点「搜索」或按回车提交）",
+    ),
 ) -> dict[str, Any]:
     """
     调用 Reverb ``/api/listings/all``，返回标题、图片、价格、原页链接。
+
+    前端：搜索框旁的「搜索」按钮与回车均发起 ``GET /search?q=...``。
 
     需在 ``backend/.env`` 中配置 ``REVERB_TOKEN``（Personal Access Token）。
     """
