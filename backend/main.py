@@ -84,6 +84,8 @@ ISHIBASHI_SUGGEST_LIMIT = 24
 ISHIBASHI_PRODUCTS_LIMIT = 50
 # ``has_more`` 启发式：石桥单页接近「满页」时认为可能还有下一页
 ISHIBASHI_HAS_MORE_HINT = 24
+# 请求侧强制日元定价，降低按 IP 自动切货币的概率（与 Shopify ``currency`` 查询参数配合）
+ISHIBASHI_FORCE_CURRENCY_PARAMS = {"currency": "JPY"}
 ISHIBASHI_BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -692,7 +694,62 @@ def _ishibashi_matches_keyword(title: str, vendor: str | None, keyword: str) -> 
     return all(tok in blob for tok in tokens)
 
 
-def _ishibashi_parse_jpy_from_product(prod: dict[str, Any]) -> float | None:
+def _ishibashi_normalize_iso_currency(code: Any) -> str:
+    """三位 ISO 货币码大写；无效时返回空串。"""
+    if code is None:
+        return ""
+    s = str(code).strip().upper()
+    if len(s) >= 3 and s[:3].isalpha():
+        return s[:3]
+    return ""
+
+
+def _ishibashi_currency_from_variant(variant: dict[str, Any] | None) -> str:
+    if not isinstance(variant, dict):
+        return ""
+    for key in ("currency", "price_currency", "presentment_currency"):
+        c = _ishibashi_normalize_iso_currency(variant.get(key))
+        if c:
+            return c
+    pp = variant.get("presentment_prices")
+    if isinstance(pp, dict):
+        for sub_key in ("shop_money", "presentment_money"):
+            sm = pp.get(sub_key)
+            if isinstance(sm, dict):
+                c2 = sm.get("currency_code") or sm.get("currencyCode")
+                c = _ishibashi_normalize_iso_currency(c2)
+                if c:
+                    return c
+    return ""
+
+
+def _ishibashi_extract_currency(
+    prod: dict[str, Any],
+    *,
+    root_payload: dict[str, Any] | None,
+) -> str:
+    """Shopify JSON 中可能出现的货币字段（不假设一定是日元）。"""
+    variants = prod.get("variants")
+    if isinstance(variants, list) and variants:
+        v0 = variants[0]
+        if isinstance(v0, dict):
+            c = _ishibashi_currency_from_variant(v0)
+            if c:
+                return c
+    for key in ("currency", "price_currency"):
+        c = _ishibashi_normalize_iso_currency(prod.get(key))
+        if c:
+            return c
+    if isinstance(root_payload, dict):
+        for key in ("currency", "presentment_currency"):
+            c = _ishibashi_normalize_iso_currency(root_payload.get(key))
+            if c:
+                return c
+    return ""
+
+
+def _ishibashi_parse_price_raw_from_product(prod: dict[str, Any]) -> float | None:
+    """金额与 Shopify 展示货币一致（由 ``original_currency`` 描述）。"""
     variants = prod.get("variants")
     if isinstance(variants, list) and variants:
         v0 = variants[0]
@@ -731,7 +788,11 @@ def _ishibashi_extract_image_url(prod: dict[str, Any]) -> str:
     return ""
 
 
-def _ishibashi_product_to_raw(prod: dict[str, Any]) -> dict[str, Any] | None:
+def _ishibashi_product_to_raw(
+    prod: dict[str, Any],
+    *,
+    root_payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     handle = prod.get("handle")
     if not isinstance(handle, str) or not handle.strip():
         return None
@@ -740,25 +801,49 @@ def _ishibashi_product_to_raw(prod: dict[str, Any]) -> dict[str, Any] | None:
         return None
     url = f"{ISHIBASHI_ORIGIN}/products/{handle.strip()}"
     image_url = _ishibashi_extract_image_url(prod)
-    jpy = _ishibashi_parse_jpy_from_product(prod)
-    if jpy is None:
+    price_raw = _ishibashi_parse_price_raw_from_product(prod)
+    if price_raw is None:
         return None
+    oc = _ishibashi_extract_currency(prod, root_payload=root_payload)
+    if not oc:
+        oc = "JPY"
     condition = _ishibashi_condition_from_title(title)
     return {
         "title": title,
         "image": image_url or None,
-        "jpy": float(jpy),
+        "price_raw": float(price_raw),
+        "original_currency": oc,
         "url": url,
         "condition": condition,
     }
 
 
+def _ishibashi_amount_to_cny(
+    price_raw: float,
+    original_currency: str | None,
+    rates_map: dict[str, float],
+) -> float | None:
+    """
+    按 JSON 中的真实标价货币换算为 CNY；与全站 Frankfurter 汇价一致。
+    若未识别货币或缺失汇价，则按 JPY 兜底（与 ``original_currency`` 默认为 JPY 对齐）。
+    """
+    cur = _ishibashi_normalize_iso_currency(original_currency) or "JPY"
+    if cur == "CNY":
+        return price_raw
+    if cur in rates_map:
+        return float(price_raw) * rates_map[cur]
+    if "JPY" in rates_map:
+        return float(price_raw) * rates_map["JPY"]
+    return None
+
+
 async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
-    石桥乐器国际站（Shopify）：优先 ``/search.json``；若返回非 JSON 或无效，
-    则依次使用 ``/search/suggest.json``（Predictive Search）与 ``products.json`` 内存筛选。
+    石桥乐器国际站（Shopify）：所有请求带 ``currency=JPY``，尽量固定标价口径；
+    仍从每条 JSON 解析 ``original_currency`` + ``price_raw``，由 ``/api/search`` 侧按 Frankfurter 换算。
 
-    异常或超时返回空列表，不向外抛错。
+    优先 ``/search.json``；若返回非 JSON 或无效，则依次使用 ``/search/suggest.json`` 与
+    ``products.json`` 内存筛选。异常或超时返回空列表，不向外抛错。
     """
     q = keyword.strip()
     if not q:
@@ -770,10 +855,16 @@ async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     try:
         async with httpx.AsyncClient(timeout=22.0, follow_redirects=True) as client:
             products_primary: list[dict[str, Any]] = []
+            payload_search: dict[str, Any] | None = None
 
             r_search = await client.get(
                 ISHIBASHI_SEARCH_JSON,
-                params={"q": q, "page": pg, "limit": 24},
+                params={
+                    **ISHIBASHI_FORCE_CURRENCY_PARAMS,
+                    "q": q,
+                    "page": pg,
+                    "limit": 24,
+                },
                 headers=ISHIBASHI_BROWSER_HEADERS,
             )
             if (
@@ -781,24 +872,25 @@ async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
                 and _ishibashi_response_looks_json(r_search)
             ):
                 try:
-                    payload = r_search.json()
-                    products_primary = _ishibashi_products_from_json_payload(payload)
+                    payload_search = r_search.json()
+                    products_primary = _ishibashi_products_from_json_payload(
+                        payload_search
+                    )
                 except Exception:
                     products_primary = []
 
-            merged: list[dict[str, Any]] = []
+            merged_entries: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
             seen_handles: set[str] = set()
 
             if products_primary:
-                merged.extend(products_primary)
+                root_ps = payload_search if isinstance(payload_search, dict) else None
                 for p in products_primary:
-                    h = p.get("handle")
-                    if isinstance(h, str) and h:
-                        seen_handles.add(h)
+                    merged_entries.append((p, root_ps))
             else:
                 r_suggest = await client.get(
                     ISHIBASHI_SUGGEST_JSON,
                     params={
+                        **ISHIBASHI_FORCE_CURRENCY_PARAMS,
                         "q": q,
                         "resources[type]": "product",
                         "resources[limit]": str(min(ISHIBASHI_SUGGEST_LIMIT, 50)),
@@ -810,23 +902,33 @@ async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
                 ):
                     try:
                         sug_payload = r_suggest.json()
-                        sug_products = _ishibashi_products_from_json_payload(sug_payload)
+                        sug_products = _ishibashi_products_from_json_payload(
+                            sug_payload
+                        )
+                        sug_root = (
+                            sug_payload if isinstance(sug_payload, dict) else None
+                        )
                         for p in sug_products:
                             h = p.get("handle")
                             if isinstance(h, str) and h and h not in seen_handles:
-                                merged.append(p)
+                                merged_entries.append((p, sug_root))
                                 seen_handles.add(h)
                     except Exception:
                         pass
 
                 r_fb = await client.get(
                     ISHIBASHI_PRODUCTS_JSON,
-                    params={"limit": ISHIBASHI_PRODUCTS_LIMIT, "page": pg},
+                    params={
+                        **ISHIBASHI_FORCE_CURRENCY_PARAMS,
+                        "limit": ISHIBASHI_PRODUCTS_LIMIT,
+                        "page": pg,
+                    },
                     headers=ISHIBASHI_BROWSER_HEADERS,
                 )
                 if r_fb.status_code == 200 and _ishibashi_response_looks_json(r_fb):
                     try:
                         fb_payload = r_fb.json()
+                        fb_root = fb_payload if isinstance(fb_payload, dict) else None
                         fb_all = fb_payload.get("products")
                         if isinstance(fb_all, list):
                             for p in fb_all:
@@ -840,14 +942,14 @@ async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
                                     str(p.get("vendor") or ""),
                                     q,
                                 ):
-                                    merged.append(p)
+                                    merged_entries.append((p, fb_root))
                                     seen_handles.add(h)
                     except Exception:
                         pass
 
             out: list[dict[str, Any]] = []
-            for prod in merged:
-                raw = _ishibashi_product_to_raw(prod)
+            for prod, root_ctx in merged_entries:
+                raw = _ishibashi_product_to_raw(prod, root_payload=root_ctx)
                 if raw is not None:
                     out.append(raw)
 
@@ -1160,8 +1262,11 @@ async def api_search(
         _, cur = _reverb_amount_currency(listing)
         if cur:
             currencies.add(cur)
-    if digi_raw or ishi_raw:
+    if digi_raw:
         currencies.add("JPY")
+    for ib in ishi_raw:
+        ic = _ishibashi_normalize_iso_currency(ib.get("original_currency")) or "JPY"
+        currencies.add(ic)
     if gg_raw:
         currencies.add("GBP")
 
@@ -1238,10 +1343,12 @@ async def api_search(
         )
 
     for ib in ishi_raw:
-        jpy_ib = float(ib["jpy"])
-        pcny_ib: float | None = None
-        if "JPY" in rates_map:
-            pcny_ib = jpy_ib * rates_map["JPY"]
+        amt_ib = float(ib["price_raw"])
+        pcny_ib = _ishibashi_amount_to_cny(
+            amt_ib,
+            str(ib.get("original_currency") or "JPY"),
+            rates_map,
+        )
         ib_cond = str(ib.get("condition") or "二手")
         if ib_cond not in ("全新", "二手"):
             ib_cond = "二手"
