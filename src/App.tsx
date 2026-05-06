@@ -596,20 +596,27 @@ function App() {
             </p>
           )}
 
-          {listings.length > 0 && (
-            <div className="mx-auto mb-8 flex flex-col items-center gap-1">
-              <span className="text-[11px] font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                排序
-              </span>
-              <SortOrderMenu value={sortOrder} onChange={setSortOrder} disabled={loading} />
+          {submittedQuery && !error && (
+            <div
+              className="mx-auto mb-6 flex flex-col gap-3 sm:mb-8 sm:flex-row sm:items-center sm:justify-between sm:gap-4"
+              aria-live="polite"
+            >
+              <p className="min-h-[1.375rem] flex-1 text-center text-sm font-medium text-slate-500 dark:text-slate-400 sm:min-w-0 sm:text-left">
+                {loading && '正在搜寻全球货源…'}
+                {!loading && listings.length > 0 && (
+                  <>🔍 为您找到 {listings.length} 个全球淘琴结果</>
+                )}
+                {!loading && listings.length === 0 && '未找到相关吉他，尝试换个关键词试试？'}
+              </p>
+              {listings.length > 0 && (
+                <div className="flex shrink-0 flex-col items-center gap-1 sm:items-end">
+                  <span className="text-[11px] font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                    排序
+                  </span>
+                  <SortOrderMenu value={sortOrder} onChange={setSortOrder} disabled={loading} />
+                </div>
+              )}
             </div>
-          )}
-
-          {!loading && !error && listings.length === 0 && (
-            <p className="mt-6 text-center text-slate-600 dark:text-slate-400">
-              没有结果，可换个关键词（例如 <strong className="font-medium">Fender</strong>、
-              <strong className="font-medium">Mustang</strong>）。
-            </p>
           )}
 
           {loading && !error && <ResultsGridSkeleton />}
