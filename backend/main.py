@@ -18,7 +18,7 @@ import re
 import traceback
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlparse, urlunparse
+from urllib.parse import quote_plus, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -281,6 +281,49 @@ def _parse_gbp_price_text(price_blob: str) -> float | None:
         return None
 
 
+def _guitarguitar_upgrade_image_url(absolute_url: str) -> str:
+    """
+    GuitarGuitar 列表缩略图 URL → 尽量换成高清地址。
+
+    规则摘要（见下方「替换规则」）；任一步异常则返回原始 ``absolute_url``，避免裂图。
+    """
+    original = (absolute_url or "").strip()
+    if not original:
+        return absolute_url
+    try:
+        # 路径/文件名中的低清标记
+        s = (
+            original.replace("/120/", "/1000/")
+            .replace("/250/", "/1000/")
+            .replace("_preview", "")
+            .replace("_small", "")
+            .replace("-thumb", "")
+            .replace("_thumb", "")
+        )
+        parts = urlparse(s)
+        qsl = parse_qsl(parts.query, keep_blank_values=True)
+        hd = "1000"
+        new_qsl: list[tuple[str, str]] = []
+        for k, v in qsl:
+            kl = k.lower()
+            vs = v.strip()
+            if kl in ("w", "width") and vs.isdigit() and int(vs) < 800:
+                new_qsl.append((k, hd))
+            elif kl in ("h", "height") and vs.isdigit() and int(vs) < 800:
+                new_qsl.append((k, hd))
+            elif kl == "size" and v.lower() in ("small", "thumb", "thumbnail", "s"):
+                continue
+            else:
+                new_qsl.append((k, v))
+        query = urlencode(new_qsl)
+        out = urlunparse(parts._replace(query=query))
+        if not out.startswith("http://") and not out.startswith("https://"):
+            return original
+        return out
+    except Exception:
+        return original
+
+
 def _guitarguitar_anchor_to_raw(anchor: Any) -> dict[str, Any] | None:
     """单条 ``a.product``（Pre-Owned 列表）→ 标题、图片、英镑价格、链接。"""
     href = (anchor.get("href") or "").strip()
@@ -301,10 +344,19 @@ def _guitarguitar_anchor_to_raw(anchor: Any) -> dict[str, Any] | None:
 
     image: str | None = None
     for img in anchor.select("img"):
-        ds = (img.get("data-src") or "").strip()
-        if ds and "blank" not in ds.casefold():
-            image = urljoin(GUITARGUITAR_ORIGIN, ds)
+        try:
+            raw = (
+                (img.get("data-src") or "").strip()
+                or (img.get("data-original") or "").strip()
+                or (img.get("src") or "").strip()
+            )
+            if not raw or "blank" in raw.casefold():
+                continue
+            base = urljoin(GUITARGUITAR_ORIGIN, raw)
+            image = _guitarguitar_upgrade_image_url(base)
             break
+        except Exception:
+            continue
 
     url = urljoin(GUITARGUITAR_ORIGIN, href)
     return {
@@ -436,6 +488,7 @@ async def scrape_guitarguitar(keyword: str, page: int = 1) -> list[dict[str, Any
     """
     异步抓取 GuitarGuitar Pre-Owned 搜索列表（与站点 HTML ``a.product`` 解析一致）。
 
+    商品图在 ``_guitarguitar_anchor_to_raw`` 中经 ``_guitarguitar_upgrade_image_url`` 做高清化。
     异常或超时返回空列表，不向外抛错。
     """
     q = keyword.strip()
