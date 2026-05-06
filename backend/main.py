@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
-`GET /api/search` 并发请求 Reverb、Digimart、GuitarGuitar 与 Ishibashi（石桥乐器国际站 Shopify）；单方失败返回空列表，不影响其余平台。
+`GET /api/search` 并发请求 Reverb、Digimart、GuitarGuitar、Ishibashi（石桥乐器国际站 Shopify）与 Swee Lee（新加坡站 Shopify）；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
 
@@ -93,6 +93,23 @@ ISHIBASHI_BROWSER_HEADERS = {
     ),
     "Accept": "application/json, text/javascript, */*;q=0.1",
     "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+}
+
+SWEELEE_ORIGIN = "https://www.sweelee.com.sg"
+SWEELEE_SEARCH_JSON = f"{SWEELEE_ORIGIN}/search.json"
+SWEELEE_SUGGEST_JSON = f"{SWEELEE_ORIGIN}/search/suggest.json"
+SWEELEE_PRODUCTS_JSON = f"{SWEELEE_ORIGIN}/products.json"
+SWEELEE_SUGGEST_LIMIT = 24
+SWEELEE_PRODUCTS_LIMIT = 50
+SWEELEE_HAS_MORE_HINT = 24
+SWEELEE_FORCE_CURRENCY_PARAMS = {"currency": "SGD"}
+SWEELEE_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*;q=0.1",
+    "Accept-Language": "en-SG,en-US;q=0.9,en;q=0.8",
 }
 
 GUITARGUITAR_BROWSER_HEADERS = {
@@ -837,6 +854,151 @@ def _ishibashi_amount_to_cny(
     return None
 
 
+def _sweelee_upgrade_image_url(src: str) -> str:
+    s = (src or "").strip()
+    if not s:
+        return s
+    out = s
+    if "_small" in out or "_medium" in out:
+        for suf in ("_small", "_medium"):
+            if suf in out:
+                out = out.replace(suf, "_1024x1024")
+                break
+    return out
+
+
+def _sweelee_tags_blob(prod: dict[str, Any]) -> str:
+    raw = prod.get("tags")
+    if isinstance(raw, list):
+        return ", ".join(str(t) for t in raw if t is not None)
+    if isinstance(raw, str):
+        return raw
+    return ""
+
+
+def _sweelee_collections_blob(prod: dict[str, Any]) -> str:
+    parts: list[str] = []
+    cols = prod.get("collections")
+    if isinstance(cols, list):
+        for c in cols:
+            if isinstance(c, dict):
+                parts.append(str(c.get("handle") or c.get("title") or ""))
+            elif isinstance(c, str):
+                parts.append(c)
+    return ", ".join(parts)
+
+
+def _sweelee_condition_from_product(prod: dict[str, Any]) -> str:
+    """
+    Swee Lee：B-Stock → ``全新``（按站点常见口径）；Used / Pre-Loved 等 → ``二手``；
+    默认 ``二手``。
+    """
+    title = str(prod.get("title") or "")
+    tags_blob = _sweelee_tags_blob(prod)
+    col_blob = _sweelee_collections_blob(prod)
+    product_type = str(prod.get("product_type") or prod.get("type") or "")
+    blob_lower = f"{title} {tags_blob} {col_blob} {product_type}".lower()
+    if re.search(r"b[-\s]?stock", blob_lower):
+        return "全新"
+    if re.search(r"\b(pre-owned|pre-loved|second[\s-]hand)\b", blob_lower):
+        return "二手"
+    if re.search(r"\bused\b", blob_lower) or ("used-" in blob_lower):
+        return "二手"
+    if "中古" in title:
+        return "二手"
+    if "二手" in (tags_blob + col_blob):
+        return "二手"
+    return "二手"
+
+
+def _sweelee_parse_price_raw_from_product(prod: dict[str, Any]) -> float | None:
+    variants = prod.get("variants")
+    if isinstance(variants, list) and variants:
+        v0 = variants[0]
+        if isinstance(v0, dict) and v0.get("price") is not None:
+            try:
+                x = float(v0["price"])
+                return x if x > 0 else None
+            except (TypeError, ValueError):
+                pass
+    for key in ("price", "price_min", "price_max"):
+        raw_v = prod.get(key)
+        if raw_v is not None:
+            try:
+                x = float(raw_v)
+                return x if x > 0 else None
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _sweelee_extract_first_image_src(prod: dict[str, Any]) -> str:
+    images = prod.get("images")
+    if isinstance(images, list) and images:
+        im0 = images[0]
+        if isinstance(im0, dict):
+            u = (im0.get("src") or "").strip()
+            if u:
+                return _sweelee_upgrade_image_url(u)
+        elif isinstance(im0, str):
+            s = im0.strip()
+            if s:
+                return _sweelee_upgrade_image_url(s)
+    fi = prod.get("featured_image")
+    if isinstance(fi, dict):
+        u = (fi.get("url") or "").strip()
+        if u:
+            return _sweelee_upgrade_image_url(u)
+    u2 = str(prod.get("image") or "").strip()
+    if u2:
+        return _sweelee_upgrade_image_url(u2)
+    return ""
+
+
+def _sweelee_products_from_suggest_payload(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    resources = data.get("resources")
+    if not isinstance(resources, dict):
+        return []
+    results = resources.get("results")
+    if not isinstance(results, dict):
+        return []
+    prods = results.get("products")
+    if isinstance(prods, list):
+        return [p for p in prods if isinstance(p, dict)]
+    return []
+
+
+def _sweelee_product_to_raw(
+    prod: dict[str, Any],
+    *,
+    root_payload: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    handle = prod.get("handle")
+    if not isinstance(handle, str) or not handle.strip():
+        return None
+    title = str(prod.get("title") or "").strip()
+    if not title:
+        return None
+    url = f"{SWEELEE_ORIGIN}/products/{handle.strip()}"
+    image_url = _sweelee_extract_first_image_src(prod)
+    price_raw = _sweelee_parse_price_raw_from_product(prod)
+    if price_raw is None:
+        return None
+    oc = _ishibashi_extract_currency(prod, root_payload=root_payload)
+    if not oc:
+        oc = "SGD"
+    return {
+        "title": title,
+        "image": image_url or None,
+        "price_raw": float(price_raw),
+        "original_currency": oc,
+        "url": url,
+        "condition": _sweelee_condition_from_product(prod),
+    }
+
+
 async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
     石桥乐器国际站（Shopify）：所有请求带 ``currency=JPY``，尽量固定标价口径；
@@ -1007,6 +1169,189 @@ async def _safe_scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, 
         return []
 
 
+async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
+    """
+    Swee Lee 新加坡站：优先调用官方 Shopify 风格 ``search.json``（与设计 URL 对齐）；
+    若当前主题为 Headless/React 以至返回 HTML，则降级 ``search/suggest.json`` 与
+    ``products.json`` 分页筛选（与 Ishibashi 合并策略同源）。
+
+    标价货币：解析 JSON 中真实 ``original_currency``；缺省为 ``SGD``；``currency=SGD``
+    参数用于尽量固定标价口径。
+    """
+    q = keyword.strip()
+    if not q:
+        logger.info("[Swee Lee] scrape skipped (empty keyword)")
+        return []
+
+    pg = max(1, int(page))
+
+    logger.info("[Swee Lee] scrape start keyword=%r page=%s", q, pg)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(9.0, connect=5.0),
+            follow_redirects=True,
+        ) as client:
+            merged_entries: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+            seen_handles: set[str] = set()
+            payload_search: dict[str, Any] | None = None
+
+            products_primary: list[dict[str, Any]] = []
+            r_search = await client.get(
+                SWEELEE_SEARCH_JSON,
+                params={
+                    **SWEELEE_FORCE_CURRENCY_PARAMS,
+                    "q": q,
+                    "page": pg,
+                    "limit": 24,
+                },
+                headers=SWEELEE_BROWSER_HEADERS,
+            )
+
+            if r_search.status_code == 200 and _ishibashi_response_looks_json(r_search):
+                try:
+                    payload_search = r_search.json()
+                    products_primary = _ishibashi_products_from_json_payload(
+                        payload_search
+                    )
+                except Exception:
+                    products_primary = []
+
+            if products_primary:
+                root_ps = payload_search if isinstance(payload_search, dict) else None
+                for p in products_primary:
+                    h = p.get("handle")
+                    if isinstance(h, str) and h and h.strip():
+                        merged_entries.append((p, root_ps))
+                        seen_handles.add(h.strip())
+            else:
+                if pg == 1:
+                    r_suggest = await client.get(
+                        SWEELEE_SUGGEST_JSON,
+                        params={
+                            **SWEELEE_FORCE_CURRENCY_PARAMS,
+                            "q": q,
+                            "resources[type]": "product",
+                            "resources[limit]": str(
+                                min(SWEELEE_SUGGEST_LIMIT, 50),
+                            ),
+                        },
+                        headers=SWEELEE_BROWSER_HEADERS,
+                    )
+                    if r_suggest.status_code == 200 and _ishibashi_response_looks_json(
+                        r_suggest
+                    ):
+                        try:
+                            sug_payload = r_suggest.json()
+                            sug_products = _sweelee_products_from_suggest_payload(
+                                sug_payload,
+                            )
+                            sug_root = (
+                                sug_payload if isinstance(sug_payload, dict) else None
+                            )
+                            for p in sug_products:
+                                h = p.get("handle")
+                                if isinstance(h, str) and h and h not in seen_handles:
+                                    merged_entries.append((p, sug_root))
+                                    seen_handles.add(h)
+                        except Exception:
+                            pass
+
+                r_fb = await client.get(
+                    SWEELEE_PRODUCTS_JSON,
+                    params={
+                        **SWEELEE_FORCE_CURRENCY_PARAMS,
+                        "limit": SWEELEE_PRODUCTS_LIMIT,
+                        "page": pg,
+                    },
+                    headers=SWEELEE_BROWSER_HEADERS,
+                )
+                if r_fb.status_code == 200 and _ishibashi_response_looks_json(r_fb):
+                    try:
+                        fb_payload = r_fb.json()
+                        fb_root = fb_payload if isinstance(fb_payload, dict) else None
+                        fb_all = fb_payload.get("products")
+                        if isinstance(fb_all, list):
+                            for p in fb_all:
+                                if not isinstance(p, dict):
+                                    continue
+                                h = p.get("handle")
+                                if (
+                                    not isinstance(h, str)
+                                    or not h
+                                    or h in seen_handles
+                                ):
+                                    continue
+                                if _ishibashi_matches_keyword(
+                                    str(p.get("title") or ""),
+                                    str(p.get("vendor") or ""),
+                                    q,
+                                ):
+                                    merged_entries.append((p, fb_root))
+                                    seen_handles.add(h)
+                    except Exception:
+                        pass
+
+            out: list[dict[str, Any]] = []
+            for prod, root_ctx in merged_entries:
+                raw = _sweelee_product_to_raw(prod, root_payload=root_ctx)
+                if raw is not None:
+                    out.append(raw)
+
+            logger.info(
+                "[Swee Lee] scrape success keyword=%r page=%s items=%s",
+                q,
+                pg,
+                len(out),
+            )
+            return out
+
+    except Exception as e:
+        line = (
+            f"[Swee Lee] scrape_sweelee error | keyword={q!r} page={pg} | "
+            f"type={type(e).__name__} | details={str(e)}"
+        )
+        print(line, flush=True)
+        logger.error(line, exc_info=True)
+        if isinstance(e, httpx.HTTPStatusError):
+            resp = e.response
+            if resp is not None:
+                snippet = (resp.text or "")[:500].replace("\n", " ")
+                detail = (
+                    f"[Swee Lee] HTTPStatusError status_code={resp.status_code} "
+                    f"url={resp.url} body_snippet={snippet!r}"
+                )
+                print(detail, flush=True)
+                logger.error(detail)
+        elif isinstance(e, httpx.TimeoutException):
+            detail = "[Swee Lee] Timeout — 请求超时"
+            print(detail, flush=True)
+            logger.error(detail)
+        elif isinstance(e, httpx.RequestError):
+            detail = f"[Swee Lee] RequestError: {e!r}"
+            print(detail, flush=True)
+            logger.error(detail)
+        tb = traceback.format_exc()
+        print(f"[Swee Lee] full traceback:\n{tb}", flush=True)
+        return []
+
+
+async def _safe_scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
+    """供 ``/api/search`` 合并：强制 10 秒兜底，不因 Swee Lee 卡住主链路。"""
+    q = keyword.strip()
+    if not q:
+        return []
+    pg = max(1, int(page))
+    try:
+        return await asyncio.wait_for(scrape_sweelee(q, pg), timeout=10.0)
+    except asyncio.TimeoutError:
+        logger.warning("[Swee Lee] asyncio.wait_for timeout (10s) keyword=%r page=%s", q, pg)
+        return []
+    except Exception as e:
+        logger.error("[Swee Lee] _safe_scrape_sweelee unexpected: %s", e, exc_info=True)
+        return []
+
+
 def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
     """Reverb HAL listing 的 ``price`` 对象 → 金额与 ISO 货币。"""
     price_obj = listing.get("price")
@@ -1164,13 +1509,18 @@ async def search_reverb(
 
 @app.get("/api/search")
 async def api_search(
-    q: str = Query("", description="搜索关键词；并发查询 Reverb、Digimart、GuitarGuitar、Ishibashi"),
-    page: int = Query(1, ge=1, description="页码，从 1 开始；四方使用同一页码参数"),
+    q: str = Query(
+        "",
+        description=(
+            "搜索关键词；并发查询 Reverb、Digimart、GuitarGuitar、Ishibashi、Swee Lee"
+        ),
+    ),
+    page: int = Query(1, ge=1, description="页码，从 1 开始；五方使用同一页码参数"),
 ) -> dict[str, Any]:
     """
     ``asyncio.gather`` 并发：``_safe_fetch_reverb_listings_for_merge``、``scrape_digimart``、
-    ``scrape_guitarguitar``、``_safe_scrape_ishibashi``。任一源失败时该源返回空列表，
-    不阻断其它平台；合并结果按规范化 ``url`` 去重。
+    ``scrape_guitarguitar``、``_safe_scrape_ishibashi``、``_safe_scrape_sweelee``。任一源失败时
+    该源返回空列表，不阻断其它平台；合并结果按规范化 ``url`` 去重。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
     ``url`` / ``condition``（``全新`` 或 ``二手``）。
@@ -1178,8 +1528,9 @@ async def api_search(
     Digimart 仅在第 1 页抓取（避免 SSR 多页重复）；GuitarGuitar 使用
     ``/search/?Query=…&page=…`` 并在后端按标题关键词与二手文案过滤。
     Ishibashi：Shopify ``search.json``（若非 JSON 则 ``search/suggest.json`` + ``products.json`` 筛选）。
+    Swee Lee：同上策略；``search.json`` 带 ``currency=SGD``；汇价按 JSON 实际货币（ ``SGD`` / ``CNY`` 等）。
 
-    汇价：Frankfurter（含 JPY→CNY）；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
+    汇价：Frankfurter（含 JPY / SGD→CNY）；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
     ``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
     q_clean = q.strip()
@@ -1188,16 +1539,17 @@ async def api_search(
 
     page_no = max(1, page)
     logger.info(
-        "[api/search] start concurrent Reverb+Digimart+GuitarGuitar+Ishibashi query=%r page=%s",
+        "[api/search] start concurrent Reverb+Digimart+GuitarGuitar+Ishibashi+SweeLee query=%r page=%s",
         q_clean,
         page_no,
     )
 
-    rev_out, digi_out, gg_out, ishi_out = await asyncio.gather(
+    rev_out, digi_out, gg_out, ishi_out, swee_out = await asyncio.gather(
         _safe_fetch_reverb_listings_for_merge(q_clean, page_no),
         scrape_digimart(q_clean, page_no),
         scrape_guitarguitar(q_clean, page_no),
         _safe_scrape_ishibashi(q_clean, page_no),
+        _safe_scrape_sweelee(q_clean, page_no),
         return_exceptions=True,
     )
 
@@ -1231,10 +1583,21 @@ async def api_search(
                 else None
             ),
         )
+    if not isinstance(swee_out, list):
+        logger.error(
+            "[api/search] Swee Lee task returned non-list (unexpected): %r",
+            swee_out,
+            exc_info=(
+                (type(swee_out), swee_out, swee_out.__traceback__)
+                if isinstance(swee_out, BaseException)
+                else None
+            ),
+        )
 
     digi_raw: list[dict[str, Any]] = digi_out if isinstance(digi_out, list) else []
     gg_raw: list[dict[str, Any]] = gg_out if isinstance(gg_out, list) else []
     ishi_raw: list[dict[str, Any]] = ishi_out if isinstance(ishi_out, list) else []
+    swee_raw: list[dict[str, Any]] = swee_out if isinstance(swee_out, list) else []
 
     if not isinstance(rev_out, list):
         if isinstance(rev_out, BaseException):
@@ -1247,7 +1610,7 @@ async def api_search(
     else:
         raw_rev = rev_out
 
-    if not raw_rev and not digi_raw and not gg_raw and not ishi_raw:
+    if not raw_rev and not digi_raw and not gg_raw and not ishi_raw and not swee_raw:
         return {"query": q_clean, "page": page_no, "has_more": False, "results": []}
 
     has_more = (
@@ -1255,6 +1618,7 @@ async def api_search(
         or (page_no == 1 and len(digi_raw) >= DIGIMART_PER_PAGE)
         or (len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
         or (len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
+        or (len(swee_raw) >= SWEELEE_HAS_MORE_HINT)
     )
 
     currencies: set[str] = {"USD"}
@@ -1269,6 +1633,9 @@ async def api_search(
         currencies.add(ic)
     if gg_raw:
         currencies.add("GBP")
+    for sw in swee_raw:
+        sc = _ishibashi_normalize_iso_currency(sw.get("original_currency")) or "SGD"
+        currencies.add(sc)
 
     async with httpx.AsyncClient(timeout=20.0) as fx_client:
         try:
@@ -1364,6 +1731,28 @@ async def api_search(
             )
         )
 
+    for sw in swee_raw:
+        amt_sw = float(sw["price_raw"])
+        pcny_sw = _ishibashi_amount_to_cny(
+            amt_sw,
+            str(sw.get("original_currency") or "SGD"),
+            rates_map,
+        )
+        sw_cond = str(sw.get("condition") or "二手")
+        if sw_cond not in ("全新", "二手"):
+            sw_cond = "二手"
+        results.append(
+            _unified_row(
+                title=str(sw["title"]),
+                image=sw.get("image"),
+                url=str(sw["url"]),
+                source="Swee Lee",
+                price_cny=pcny_sw,
+                usd_to_cny=usd_to_cny,
+                condition=sw_cond,
+            )
+        )
+
     before_dedupe = len(results)
     results = _dedupe_results_preserve_order(results)
     if before_dedupe > len(results):
@@ -1377,8 +1766,10 @@ async def api_search(
     n_dig = sum(1 for row in results if row.get("source") == "Digimart")
     n_gg = sum(1 for row in results if row.get("source") == "GuitarGuitar")
     n_ishi = sum(1 for row in results if row.get("source") == "Ishibashi")
+    n_swee = sum(1 for row in results if row.get("source") == "Swee Lee")
     logger.info(
-        "[api/search] done query=%r page=%s total=%s (reverb=%s digimart=%s guitarguitar=%s ishibashi=%s) has_more=%s",
+        "[api/search] done query=%r page=%s total=%s "
+        "(reverb=%s digimart=%s guitarguitar=%s ishibashi=%s sweelee=%s) has_more=%s",
         q_clean,
         page_no,
         len(results),
@@ -1386,6 +1777,7 @@ async def api_search(
         n_dig,
         n_gg,
         n_ishi,
+        n_swee,
         has_more,
     )
 
