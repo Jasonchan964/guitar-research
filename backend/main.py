@@ -225,11 +225,87 @@ def _parse_jpy_amount(text: str) -> int | None:
     return n if n > 0 else None
 
 
+def _blob_indicates_new_condition(blob: str) -> bool:
+    """
+    日文/英文常见「全新」信号：新品、S/S ランク、New、Unused、B-Stock 等。
+    优先于二手关键词（由调用方先判断本函数）。
+    """
+    if not blob or not str(blob).strip():
+        return False
+    t = str(blob)
+    tl = t.lower()
+    if "新品" in t or "未使用" in t:
+        return True
+    if "brand new" in tl:
+        return True
+    if re.search(r"\bunused\b", tl):
+        return True
+    if re.search(r"\bnew\b", tl):
+        return True
+    # B-Stock：站点常视为未使用/近新品档（与 Swee Lee 原逻辑一致）
+    if re.search(r"b[-\s]?stock", tl):
+        return True
+    # S 級 / S ランク / Rank S（Digimart 等；单独一个「S」也按评级处理）
+    if "sランク" in tl or "ｓランク" in tl:
+        return True
+    if re.search(r"ランク\s*[sｓＳ]", t):
+        return True
+    if re.search(r"\brank\s*s\b", tl):
+        return True
+    if re.search(
+        r"(?:コンディション|状態|condition)\s*[:：/／]?\s*[sｓＳ](?:\b|$|ランク)",
+        t,
+        re.I,
+    ):
+        return True
+    if re.search(r"(?:^|[\s:：/／|・【（+＋])[sｓＳ](?:$|[\s+）】/／+・]|ランク)", t):
+        return True
+    compact = re.sub(r"[\s　]+", "", t)
+    if re.fullmatch(r"[sｓＳ]", compact):
+        return True
+    return False
+
+
+def _blob_indicates_used_condition(blob: str) -> bool:
+    if not blob or not str(blob).strip():
+        return False
+    t = str(blob)
+    tl = t.lower()
+    if "中古" in t:
+        return True
+    if "二手" in t:
+        return True
+    if re.search(r"\bused\b", tl):
+        return True
+    if "second hand" in tl:
+        return True
+    if re.search(r"\bpre[- ]owned\b", tl):
+        return True
+    if re.search(r"pre[- ]loved", tl):
+        return True
+    return False
+
+
+def _classify_new_vs_used_from_text(*parts: str) -> str:
+    """合并多段文案后：先判全新信号，再判二手；默认二手。"""
+    blob = " ".join(p for p in parts if (p or "").strip()).strip()
+    if not blob:
+        return "二手"
+    if _blob_indicates_new_condition(blob):
+        return "全新"
+    if _blob_indicates_used_condition(blob):
+        return "二手"
+    return "二手"
+
+
 def _digimart_condition_from_block(block: Any) -> str:
     """
-    从 Digimart 列表卡片上解析成色标签文案。
-    优先扫描常见标签区域，避免标题里单独的「新」字误判（尽力而为）。
+    从 Digimart 列表卡片解析成色。
+    ``.itemState`` 内常见単品评级 ``S`` / ``Sランク``，须判为「全新」，不可用单独的「新」字启发式。
     """
+    state_el = block.select_one(".itemState")
+    status_focus = state_el.get_text(" ", strip=True) if state_el is not None else ""
+
     chunks: list[str] = []
     for sel in (
         ".itemState",
@@ -247,16 +323,13 @@ def _digimart_condition_from_block(block: Any) -> str:
         "[class*='Badge']",
     ):
         for el in block.select(sel):
-            t = el.get_text(" ", strip=True)
-            if t:
-                chunks.append(t)
+            txt = el.get_text(" ", strip=True)
+            if txt:
+                chunks.append(txt)
+
     blob = " ".join(chunks) if chunks else block.get_text(" ", strip=True)
-    blob_lower = blob.lower()
-    if "中古" in blob or "used" in blob_lower:
-        return "二手"
-    if "新" in blob:
-        return "全新"
-    return "二手"
+    combined = " ".join(x for x in (status_focus, blob) if x).strip()
+    return _classify_new_vs_used_from_text(combined)
 
 
 def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
@@ -690,15 +763,21 @@ def _ishibashi_upgrade_image_url(src: str) -> str:
     return out
 
 
-def _ishibashi_condition_from_title(title: str) -> str:
-    """USED / 中古 → 二手；NEW / 新品 → 全新；否则默认二手。"""
-    t = title or ""
-    tl = t.lower()
-    if "中古" in t or "second hand" in tl or re.search(r"\bused\b", tl):
-        return "二手"
-    if "新品" in t or "brand new" in tl or re.search(r"\bnew\b", tl):
-        return "全新"
-    return "二手"
+def _ishibashi_tags_blob(prod: dict[str, Any]) -> str:
+    raw = prod.get("tags")
+    if isinstance(raw, list):
+        return ", ".join(str(x) for x in raw if x is not None)
+    if isinstance(raw, str):
+        return raw
+    return ""
+
+
+def _ishibashi_condition_from_product(prod: dict[str, Any]) -> str:
+    """标题 + tags + vendor：与全站一致，识别 S 级 / New / 新品 / Unused 等为全新。"""
+    title = str(prod.get("title") or "")
+    tags = _ishibashi_tags_blob(prod)
+    vendor = str(prod.get("vendor") or "")
+    return _classify_new_vs_used_from_text(title, tags, vendor)
 
 
 def _ishibashi_matches_keyword(title: str, vendor: str | None, keyword: str) -> bool:
@@ -828,7 +907,7 @@ def _ishibashi_product_to_raw(
     oc = _ishibashi_extract_currency(prod, root_payload=root_payload)
     if not oc:
         oc = "JPY"
-    condition = _ishibashi_condition_from_title(title)
+    condition = _ishibashi_condition_from_product(prod)
     return {
         "title": title,
         "image": image_url or None,
@@ -894,25 +973,14 @@ def _sweelee_collections_blob(prod: dict[str, Any]) -> str:
 
 def _sweelee_condition_from_product(prod: dict[str, Any]) -> str:
     """
-    Swee Lee：B-Stock → ``全新``（按站点常见口径）；Used / Pre-Loved 等 → ``二手``；
-    默认 ``二手``。
+    Swee Lee：标题 / 标签 / 集合 / 类型 合并判定（与 Ishibashi / Digimart 信号一致）。
+    B-Stock、New、S ランク、Unused 等为全新；Used / Pre-Loved / 中古 等为二手。
     """
     title = str(prod.get("title") or "")
     tags_blob = _sweelee_tags_blob(prod)
     col_blob = _sweelee_collections_blob(prod)
     product_type = str(prod.get("product_type") or prod.get("type") or "")
-    blob_lower = f"{title} {tags_blob} {col_blob} {product_type}".lower()
-    if re.search(r"b[-\s]?stock", blob_lower):
-        return "全新"
-    if re.search(r"\b(pre-owned|pre-loved|second[\s-]hand)\b", blob_lower):
-        return "二手"
-    if re.search(r"\bused\b", blob_lower) or ("used-" in blob_lower):
-        return "二手"
-    if "中古" in title:
-        return "二手"
-    if "二手" in (tags_blob + col_blob):
-        return "二手"
-    return "二手"
+    return _classify_new_vs_used_from_text(title, tags_blob, col_blob, product_type)
 
 
 def _sweelee_parse_price_raw_from_product(prod: dict[str, Any]) -> float | None:
