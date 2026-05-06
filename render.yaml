@@ -11,3 +11,5 @@ services:
     envVars:
       - key: REVERB_TOKEN
         sync: false
+      - key: EXCHANGE_RATE_API_KEY
+        sync: false

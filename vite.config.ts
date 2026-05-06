@@ -18,4 +18,17 @@ export default defineConfig({
       },
     },
   },
+  // npm run preview：与 dev 相同代理，便于本地预览生产构建并连后端
+  preview: {
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/search': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
+  },
 })

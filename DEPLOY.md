@@ -6,7 +6,9 @@
 
 1. **GitHub 账号**：把本文件夹 `guitar-search` 打成仓库并推送（代码里不要提交 `.env` / `.env.txt`）。
 2. **Render 账号**：[https://render.com](https://render.com) 用 GitHub 登录。
-3. **Reverb Token**：在 Render 控制台里配置环境变量（不要写进代码）。
+3. **密钥**：在 Render 控制台 **Environment** 里配置（不要写进代码）：
+   - **`REVERB_TOKEN`**：Reverb Personal Access Token  
+   - **`EXCHANGE_RATE_API_KEY`**：[ExchangeRate-API](https://www.exchangerate-api.com/) 密钥（用于 **`/api/exchange-rate`**）
 
 ## 用 Blueprint 一键部署（推荐）
 

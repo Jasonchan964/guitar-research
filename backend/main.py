@@ -23,6 +23,7 @@ from env_load import load_project_dotenv
 
 load_project_dotenv()
 
+from exchange_rate_cache import get_usd_cny_rate_cached
 from reverb_client import listing_to_search_item, search_reverb_listings_async
 
 FRANKFURTER = "https://api.frankfurter.app/latest"
@@ -141,6 +142,17 @@ async def get_rates_to_cny(client: httpx.AsyncClient, currencies: set[str]) -> d
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/exchange-rate")
+async def exchange_rate() -> dict[str, float]:
+    """
+    USD→CNY 参考汇率（ExchangeRate-API v6），进程内缓存 1 小时。
+
+    环境变量：``EXCHANGE_RATE_API_KEY``
+    """
+    rate = await get_usd_cny_rate_cached()
+    return {"rate": round(rate, 4)}
 
 
 @app.get("/search")
