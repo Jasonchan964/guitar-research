@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Search } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Search } from 'lucide-react'
 import type { UnifiedListing, UnifiedSearchApiResponse } from './mockGuitars'
 
 const PLACEHOLDER_IMG =
@@ -117,6 +117,75 @@ type SearchClusterProps = {
   onSubmitSearch: () => void
 }
 
+/** 当前页 ±2；无更多页时右侧不延伸 */
+function buildPageRange(current: number, hasMore: boolean): number[] {
+  const spread = 2
+  const start = Math.max(1, current - spread)
+  const end = Math.max(current, hasMore ? current + spread : current)
+  const out: number[] = []
+  for (let p = start; p <= end; p++) out.push(p)
+  return out
+}
+
+type PaginationBarProps = {
+  currentPage: number
+  hasMore: boolean
+  loading: boolean
+  onPageChange: (page: number) => void
+}
+
+function PaginationBar({ currentPage, hasMore, loading, onPageChange }: PaginationBarProps) {
+  const pages = buildPageRange(currentPage, hasMore)
+  const canPrev = currentPage > 1 && !loading
+  const canNext = hasMore && !loading
+
+  return (
+    <nav
+      className="mt-12 flex flex-wrap items-center justify-center gap-1 sm:gap-2"
+      aria-label="分页"
+    >
+      <button
+        type="button"
+        disabled={!canPrev}
+        onClick={() => onPageChange(currentPage - 1)}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-600 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent dark:text-slate-300 dark:hover:bg-slate-800 dark:disabled:hover:bg-transparent"
+        aria-label="上一页"
+      >
+        <ChevronLeft className="h-5 w-5" strokeWidth={2} />
+      </button>
+      {pages.map((p) => {
+        const active = p === currentPage
+        return (
+          <button
+            key={p}
+            type="button"
+            disabled={loading}
+            onClick={() => onPageChange(p)}
+            className={`inline-flex min-w-[2.25rem] items-center justify-center rounded-full px-3 py-1.5 text-sm font-medium tabular-nums transition-colors ${
+              active
+                ? 'bg-slate-900 text-white shadow-sm dark:bg-white dark:text-slate-900'
+                : 'text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800'
+            } disabled:opacity-50`}
+            aria-label={`第 ${p} 页`}
+            aria-current={active ? 'page' : undefined}
+          >
+            {p}
+          </button>
+        )
+      })}
+      <button
+        type="button"
+        disabled={!canNext}
+        onClick={() => onPageChange(currentPage + 1)}
+        className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-600 transition-colors hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent dark:text-slate-300 dark:hover:bg-slate-800 dark:disabled:hover:bg-transparent"
+        aria-label="下一页"
+      >
+        <ChevronRight className="h-5 w-5" strokeWidth={2} />
+      </button>
+    </nav>
+  )
+}
+
 function SearchCluster({
   compact,
   query,
@@ -182,6 +251,8 @@ function SearchCluster({
 function App() {
   const [query, setQuery] = useState('')
   const [submittedQuery, setSubmittedQuery] = useState<string | null>(null)
+  const [currentPage, setCurrentPage] = useState(1)
+  const [hasMore, setHasMore] = useState(false)
   const [listings, setListings] = useState<UnifiedListing[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -219,22 +290,30 @@ function App() {
 
   const rateReady = !rateLoading && exchangeRate != null && !rateError
 
-  const runSearchWithQuery = async (q: string) => {
+  const fetchSearchPage = async (q: string, page: number) => {
     const trimmed = q.trim()
     if (!trimmed) return
 
-    setSubmittedQuery(trimmed)
     setLoading(true)
     setError(null)
 
     try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(trimmed)}`)
+      const qs = new URLSearchParams({
+        q: trimmed,
+        page: String(page),
+      })
+      const res = await fetch(`/api/search?${qs.toString()}`)
       if (!res.ok) {
         const text = await res.text()
         throw new Error(text || `请求失败 (${res.status})`)
       }
       const data: UnifiedSearchApiResponse = await res.json()
       setListings(data.results)
+      setCurrentPage(data.page ?? page)
+      setHasMore(Boolean(data.has_more))
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: 0, behavior: 'smooth' })
+      })
     } catch (e) {
       setListings([])
       setError(e instanceof Error ? e.message : '网络错误')
@@ -243,8 +322,23 @@ function App() {
     }
   }
 
+  /** 新关键词搜索：回到第 1 页 */
+  const runSearchWithQuery = (q: string) => {
+    const trimmed = q.trim()
+    if (!trimmed) return
+    setSubmittedQuery(trimmed)
+    setCurrentPage(1)
+    void fetchSearchPage(trimmed, 1)
+  }
+
   const handleSubmitSearch = () => {
-    void runSearchWithQuery(query)
+    runSearchWithQuery(query)
+  }
+
+  const handlePageChange = (page: number) => {
+    if (!submittedQuery || page < 1 || loading) return
+    if (page === currentPage) return
+    void fetchSearchPage(submittedQuery, page)
   }
 
   const showResults = submittedQuery !== null
@@ -321,6 +415,7 @@ function App() {
           {submittedQuery && (
             <p className="mb-2 text-center text-sm text-slate-500 dark:text-slate-400">
               Reverb + Digimart 搜索结果 · 「{submittedQuery}」
+              {` · 第 ${currentPage} 页`}
               {loading && ' · 加载中…'}
             </p>
           )}
@@ -395,6 +490,15 @@ function App() {
                 ))}
               </ul>
             </section>
+          )}
+
+          {submittedQuery && !error && (
+            <PaginationBar
+              currentPage={currentPage}
+              hasMore={hasMore}
+              loading={loading}
+              onPageChange={handlePageChange}
+            />
           )}
         </main>
       )}

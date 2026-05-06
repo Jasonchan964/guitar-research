@@ -52,6 +52,9 @@ HAS_FRONTEND = (DIST_DIR / "index.html").is_file()
 
 DIGIMART_ORIGIN = "https://www.digimart.net"
 DIGIMART_SEARCH = f"{DIGIMART_ORIGIN}/search"
+# Reverb ``per_page`` 与列表「满页」启发式；Digimart 搜索页常见每页 20 条
+REVERB_PER_PAGE = 24
+DIGIMART_PER_PAGE = 20
 # 常见桌面 Chrome UA，降低被站点拒绝的概率（仍需遵守对方 robots/条款）
 DIGIMART_BROWSER_HEADERS = {
     "User-Agent": (
@@ -176,9 +179,10 @@ def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
     return {"title": title, "image": image, "jpy": jpy, "url": url}
 
 
-async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
+async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
     异步抓取 Digimart 搜索页（与 ``test_digimart.py`` 同源解析逻辑）。
+    分页：查询参数 ``currentPageNo``（1-based，与站点一致）。
     网络/HTML 异常时返回空列表，不向外抛错，避免拖累 Reverb。
     """
     q = keyword.strip()
@@ -186,18 +190,21 @@ async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
         logger.info("[Digimart] scrape skipped (empty keyword)")
         return []
 
-    logger.info("[Digimart] scrape start keyword=%r", q)
+    pg = max(1, int(page))
+    logger.info("[Digimart] scrape start keyword=%r page=%s", q, pg)
     try:
+        params: dict[str, Any] = {"keyword": q, "currentPageNo": pg}
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(
                 DIGIMART_SEARCH,
-                params={"keyword": q},
+                params=params,
                 headers=DIGIMART_BROWSER_HEADERS,
             )
             r.raise_for_status()
 
         logger.info(
-            "[Digimart] http ok status=%s response_bytes=%s",
+            "[Digimart] http ok page=%s status=%s response_bytes=%s",
+            pg,
             r.status_code,
             len(r.text or ""),
         )
@@ -209,7 +216,12 @@ async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
             if item is not None:
                 out.append(item)
 
-        logger.info("[Digimart] scrape success keyword=%r parsed_items=%s", q, len(out))
+        logger.info(
+            "[Digimart] scrape success keyword=%r page=%s parsed_items=%s",
+            q,
+            pg,
+            len(out),
+        )
         if not out and len(r.text or "") > 500:
             logger.warning(
                 "[Digimart] zero parsed items but large HTML (%s bytes) — "
@@ -219,7 +231,7 @@ async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
         return out
     except Exception as e:
         line = (
-            f"[Digimart] scrape_digimart error | keyword={q!r} | "
+            f"[Digimart] scrape_digimart error | keyword={q!r} page={pg} | "
             f"type={type(e).__name__} | details={str(e)}"
         )
         print(line, flush=True)
@@ -267,11 +279,17 @@ def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str 
     return amt, c if c else None
 
 
-async def _fetch_reverb_listings(query: str) -> list[dict[str, Any]]:
+async def _fetch_reverb_listings(query: str, page: int = 1) -> list[dict[str, Any]]:
     token = os.environ.get("REVERB_TOKEN", "").strip()
     if not token:
         return []
-    return await search_reverb_listings_async(token, query)
+    pg = max(1, int(page))
+    return await search_reverb_listings_async(
+        token,
+        query,
+        page=pg,
+        per_page=REVERB_PER_PAGE,
+    )
 
 
 def _unified_row(
@@ -352,23 +370,30 @@ async def search_reverb(
 @app.get("/api/search")
 async def api_search(
     q: str = Query("", description="搜索关键词；并发查询 Reverb API 与 Digimart"),
+    page: int = Query(1, ge=1, description="页码，从 1 开始；Reverb 与 Digimart 使用同一页码"),
 ) -> dict[str, Any]:
     """
     ``asyncio.gather`` 并发：Reverb（需 ``REVERB_TOKEN``）与 ``scrape_digimart``。
     Digimart 异常已吞掉；Reverb 仍按原 API 报错规则抛出。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` / ``url``。
+    响应含 ``page``、``has_more``（任一侧满页则视为可能还有下一页）。
     汇价：Frankfurter（``amount * (1 单位外币→CNY)``）；``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
     q_clean = q.strip()
     if not q_clean:
-        return {"query": "", "results": []}
+        return {"query": "", "page": 1, "has_more": False, "results": []}
 
-    logger.info("[api/search] start concurrent Reverb+Digimart query=%r", q_clean)
+    page_no = max(1, page)
+    logger.info(
+        "[api/search] start concurrent Reverb+Digimart query=%r page=%s",
+        q_clean,
+        page_no,
+    )
 
     rev_out, digi_out = await asyncio.gather(
-        _fetch_reverb_listings(q_clean),
-        scrape_digimart(q_clean),
+        _fetch_reverb_listings(q_clean, page_no),
+        scrape_digimart(q_clean, page_no),
         return_exceptions=True,
     )
 
@@ -404,7 +429,9 @@ async def api_search(
     raw_rev = rev_out
 
     if not raw_rev and not digi_raw:
-        return {"query": q_clean, "results": []}
+        return {"query": q_clean, "page": page_no, "has_more": False, "results": []}
+
+    has_more = (len(raw_rev) >= REVERB_PER_PAGE) or (len(digi_raw) >= DIGIMART_PER_PAGE)
 
     currencies: set[str] = {"USD"}
     for listing in raw_rev:
@@ -468,14 +495,21 @@ async def api_search(
     n_rev = sum(1 for row in results if row.get("source") == "Reverb")
     n_dig = sum(1 for row in results if row.get("source") == "Digimart")
     logger.info(
-        "[api/search] done query=%r total=%s (reverb=%s digimart=%s)",
+        "[api/search] done query=%r page=%s total=%s (reverb=%s digimart=%s) has_more=%s",
         q_clean,
+        page_no,
         len(results),
         n_rev,
         n_dig,
+        has_more,
     )
 
-    return {"query": q_clean, "results": results}
+    return {
+        "query": q_clean,
+        "page": page_no,
+        "has_more": has_more,
+        "results": results,
+    }
 
 
 if HAS_FRONTEND:

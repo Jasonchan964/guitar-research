@@ -10,6 +10,8 @@ export type UnifiedListing = {
 
 export type UnifiedSearchApiResponse = {
   query: string
+  page: number
+  has_more: boolean
   results: UnifiedListing[]
 }
 
