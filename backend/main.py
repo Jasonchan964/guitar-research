@@ -283,18 +283,27 @@ def _blob_indicates_used_condition(blob: str) -> bool:
         return True
     if re.search(r"pre[- ]loved", tl):
         return True
+    if re.search(r"\brefurbished\b", tl) or "翻新" in t or "リファービッシュ" in t:
+        return True
+    if "ヴィンテージ" in t or re.search(r"\bvintage\b", tl):
+        return True
     return False
 
 
 def _classify_new_vs_used_from_text(*parts: str) -> str:
-    """合并多段文案后：先判全新信号，再判二手；默认二手。"""
+    """
+    合并多段文案后判定成色。
+
+    **必须先判二手、再判全新**：日文常见「中古 S ランク」表示二手里品相 S 级，
+    若先命中 ``S`` 会误标为全新。
+    """
     blob = " ".join(p for p in parts if (p or "").strip()).strip()
     if not blob:
         return "二手"
-    if _blob_indicates_new_condition(blob):
-        return "全新"
     if _blob_indicates_used_condition(blob):
         return "二手"
+    if _blob_indicates_new_condition(blob):
+        return "全新"
     return "二手"
 
 
@@ -305,6 +314,11 @@ def _digimart_condition_from_block(block: Any) -> str:
     """
     state_el = block.select_one(".itemState")
     status_focus = state_el.get_text(" ", strip=True) if state_el is not None else ""
+
+    title_text = ""
+    ttl_a = block.select_one("p.ttl a")
+    if ttl_a is not None:
+        title_text = re.sub(r"\s+", " ", ttl_a.get_text(strip=True).replace("\xa0", " "))
 
     chunks: list[str] = []
     for sel in (
@@ -328,7 +342,8 @@ def _digimart_condition_from_block(block: Any) -> str:
                 chunks.append(txt)
 
     blob = " ".join(chunks) if chunks else block.get_text(" ", strip=True)
-    combined = " ".join(x for x in (status_focus, blob) if x).strip()
+    # 标题常含「中古」而状态区仅标等级字母，须一并参与判定
+    combined = " ".join(x for x in (title_text, status_focus, blob) if x).strip()
     return _classify_new_vs_used_from_text(combined)
 
 
@@ -515,9 +530,16 @@ def _guitarguitar_anchor_to_raw(anchor: Any) -> dict[str, Any] | None:
 
 
 def _reverb_condition_cn(listing: dict[str, Any]) -> str:
-    """Reverb listing 的 ``condition`` → 统一中文「全新」/「二手」。"""
+    """
+    Reverb listing 的 ``condition`` → 统一中文「全新」/「二手」。
+
+    仅将 **全新上架/原封** 类映射为「全新」。Reverb 的 **Mint / Excellent**
+    等为二手里的品相等级，**不得**当作「全新」，否则会大量误判。
+    """
     raw: Any = listing.get("condition")
+    slug_part = ""
     if isinstance(raw, dict):
+        slug_part = str(raw.get("slug") or raw.get("name") or "").strip()
         raw = (
             raw.get("display_name")
             or raw.get("name")
@@ -525,10 +547,27 @@ def _reverb_condition_cn(listing: dict[str, Any]) -> str:
             or raw.get("slug")
             or raw.get("uuid")
         )
-    if raw is None:
+    if raw is None and not slug_part:
         return "二手"
-    normalized = str(raw).strip().casefold().replace("_", " ")
-    if normalized == "brand new":
+    blob = " ".join(
+        x for x in (str(raw) if raw is not None else "", slug_part) if str(x).strip()
+    )
+    normalized = blob.strip().casefold().replace("_", " ")
+    if not normalized:
+        return "二手"
+    # 明确新品 / NOS
+    if normalized == "brand new" or "brand new" in normalized:
+        return "全新"
+    if normalized in (
+        "new",
+        "new item",
+        "new other",
+        "new old stock",
+        "new in box",
+        "nos",
+    ):
+        return "全新"
+    if "new old stock" in normalized or re.search(r"\bnos\b", normalized):
         return "全新"
     return "二手"
 
