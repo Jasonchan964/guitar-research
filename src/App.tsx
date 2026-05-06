@@ -580,7 +580,7 @@ function App() {
         <main className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
           {submittedQuery && (
             <p className="mb-2 text-center text-sm text-slate-500 dark:text-slate-400">
-              Reverb + Digimart + GuitarGuitar 搜索结果 · 「{submittedQuery}」
+              Reverb + Digimart + GuitarGuitar + Ishibashi 搜索结果 · 「{submittedQuery}」
               {` · 第 ${currentPage} 页`}
               {loading && ' · 加载中…'}
             </p>
@@ -592,7 +592,7 @@ function App() {
           )}
           {!error && (
             <p className="mb-6 text-center text-xs text-slate-400 dark:text-slate-500">
-              标价由后端换算（Frankfurter，含 GBP→CNY）；切换 USD/CNY 仅改变展示币种。
+              标价由后端换算（Frankfurter，含 JPY / GBP→CNY）；切换 USD/CNY 仅改变展示币种。
             </p>
           )}
 

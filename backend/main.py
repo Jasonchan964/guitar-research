@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
-`GET /api/search` 并发请求 Reverb、Digimart 与 GuitarGuitar（站点全局搜索筛选二手）；单方失败返回空列表，不影响其余平台。
+`GET /api/search` 并发请求 Reverb、Digimart、GuitarGuitar 与 Ishibashi（石桥乐器国际站 Shopify）；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
 
@@ -75,6 +75,24 @@ GUITARGUITAR_ORIGIN = "https://www.guitarguitar.co.uk"
 # 列表页常见每页 40 条；用于 ``has_more`` 启发式
 GUITARGUITAR_FULL_PAGE = 40
 GUITARGUITAR_MAX_PARSE = 40
+ISHIBASHI_ORIGIN = "https://intl.ishibashi.co.jp"
+# 主题常把 ``/search.json`` 渲染成 HTML；真实 JSON 多为 ``/search/suggest.json``（Predictive Search）
+ISHIBASHI_SEARCH_JSON = f"{ISHIBASHI_ORIGIN}/search.json"
+ISHIBASHI_SUGGEST_JSON = f"{ISHIBASHI_ORIGIN}/search/suggest.json"
+ISHIBASHI_PRODUCTS_JSON = f"{ISHIBASHI_ORIGIN}/products.json"
+ISHIBASHI_SUGGEST_LIMIT = 24
+ISHIBASHI_PRODUCTS_LIMIT = 50
+# ``has_more`` 启发式：石桥单页接近「满页」时认为可能还有下一页
+ISHIBASHI_HAS_MORE_HINT = 24
+ISHIBASHI_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*;q=0.1",
+    "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+}
+
 GUITARGUITAR_BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -616,6 +634,277 @@ async def scrape_guitarguitar(keyword: str, page: int = 1) -> list[dict[str, Any
         return []
 
 
+def _ishibashi_response_looks_json(response: httpx.Response) -> bool:
+    t = (response.text or "").lstrip()
+    return t.startswith("{") or t.startswith("[")
+
+
+def _ishibashi_products_from_json_payload(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("products")
+    if isinstance(raw, list):
+        return [p for p in raw if isinstance(p, dict)]
+    resources = data.get("resources")
+    if isinstance(resources, dict):
+        results = resources.get("results")
+        if isinstance(results, dict):
+            rp = results.get("products")
+            if isinstance(rp, list):
+                return [p for p in rp if isinstance(p, dict)]
+    return []
+
+
+def _ishibashi_upgrade_image_url(src: str) -> str:
+    s = (src or "").strip()
+    if not s:
+        return s
+    out = s
+    for suf in ("_small", "_medium", "_compact"):
+        if suf in out:
+            out = out.replace(suf, "_1024x1024")
+            break
+    return out
+
+
+def _ishibashi_condition_from_title(title: str) -> str:
+    """USED / 中古 → 二手；NEW / 新品 → 全新；否则默认二手。"""
+    t = title or ""
+    tl = t.lower()
+    if "中古" in t or "second hand" in tl or re.search(r"\bused\b", tl):
+        return "二手"
+    if "新品" in t or "brand new" in tl or re.search(r"\bnew\b", tl):
+        return "全新"
+    return "二手"
+
+
+def _ishibashi_matches_keyword(title: str, vendor: str | None, keyword: str) -> bool:
+    """标题 / 品牌（vendor）联合模糊匹配：整词包含或（长度>1 的）词全部命中。"""
+    q = (keyword or "").strip().lower()
+    if not q:
+        return False
+    blob = f"{title or ''} {vendor or ''}".lower()
+    if q in blob:
+        return True
+    tokens = [tok for tok in re.split(r"\s+", q) if len(tok) > 1]
+    if not tokens:
+        return q in blob
+    return all(tok in blob for tok in tokens)
+
+
+def _ishibashi_parse_jpy_from_product(prod: dict[str, Any]) -> float | None:
+    variants = prod.get("variants")
+    if isinstance(variants, list) and variants:
+        v0 = variants[0]
+        if isinstance(v0, dict):
+            raw = v0.get("price")
+            if raw is not None:
+                try:
+                    x = float(raw)
+                    return x if x > 0 else None
+                except (TypeError, ValueError):
+                    pass
+    raw2 = prod.get("price")
+    if raw2 is None:
+        return None
+    try:
+        x = float(raw2)
+        return x if x > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _ishibashi_extract_image_url(prod: dict[str, Any]) -> str:
+    fi = prod.get("featured_image")
+    if isinstance(fi, dict):
+        u = (fi.get("url") or "").strip()
+        if u:
+            return _ishibashi_upgrade_image_url(u)
+    img = (prod.get("image") or "").strip()
+    if img:
+        return _ishibashi_upgrade_image_url(img)
+    images = prod.get("images")
+    if isinstance(images, list) and images:
+        im0 = images[0]
+        if isinstance(im0, dict):
+            return _ishibashi_upgrade_image_url(str(im0.get("src") or ""))
+    return ""
+
+
+def _ishibashi_product_to_raw(prod: dict[str, Any]) -> dict[str, Any] | None:
+    handle = prod.get("handle")
+    if not isinstance(handle, str) or not handle.strip():
+        return None
+    title = str(prod.get("title") or "").strip()
+    if not title:
+        return None
+    url = f"{ISHIBASHI_ORIGIN}/products/{handle.strip()}"
+    image_url = _ishibashi_extract_image_url(prod)
+    jpy = _ishibashi_parse_jpy_from_product(prod)
+    if jpy is None:
+        return None
+    condition = _ishibashi_condition_from_title(title)
+    return {
+        "title": title,
+        "image": image_url or None,
+        "jpy": float(jpy),
+        "url": url,
+        "condition": condition,
+    }
+
+
+async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
+    """
+    石桥乐器国际站（Shopify）：优先 ``/search.json``；若返回非 JSON 或无效，
+    则依次使用 ``/search/suggest.json``（Predictive Search）与 ``products.json`` 内存筛选。
+
+    异常或超时返回空列表，不向外抛错。
+    """
+    q = keyword.strip()
+    if not q:
+        logger.info("[Ishibashi] scrape skipped (empty keyword)")
+        return []
+
+    pg = max(1, int(page))
+
+    try:
+        async with httpx.AsyncClient(timeout=22.0, follow_redirects=True) as client:
+            products_primary: list[dict[str, Any]] = []
+
+            r_search = await client.get(
+                ISHIBASHI_SEARCH_JSON,
+                params={"q": q, "page": pg, "limit": 24},
+                headers=ISHIBASHI_BROWSER_HEADERS,
+            )
+            if (
+                r_search.status_code == 200
+                and _ishibashi_response_looks_json(r_search)
+            ):
+                try:
+                    payload = r_search.json()
+                    products_primary = _ishibashi_products_from_json_payload(payload)
+                except Exception:
+                    products_primary = []
+
+            merged: list[dict[str, Any]] = []
+            seen_handles: set[str] = set()
+
+            if products_primary:
+                merged.extend(products_primary)
+                for p in products_primary:
+                    h = p.get("handle")
+                    if isinstance(h, str) and h:
+                        seen_handles.add(h)
+            else:
+                r_suggest = await client.get(
+                    ISHIBASHI_SUGGEST_JSON,
+                    params={
+                        "q": q,
+                        "resources[type]": "product",
+                        "resources[limit]": str(min(ISHIBASHI_SUGGEST_LIMIT, 50)),
+                    },
+                    headers=ISHIBASHI_BROWSER_HEADERS,
+                )
+                if r_suggest.status_code == 200 and _ishibashi_response_looks_json(
+                    r_suggest
+                ):
+                    try:
+                        sug_payload = r_suggest.json()
+                        sug_products = _ishibashi_products_from_json_payload(sug_payload)
+                        for p in sug_products:
+                            h = p.get("handle")
+                            if isinstance(h, str) and h and h not in seen_handles:
+                                merged.append(p)
+                                seen_handles.add(h)
+                    except Exception:
+                        pass
+
+                r_fb = await client.get(
+                    ISHIBASHI_PRODUCTS_JSON,
+                    params={"limit": ISHIBASHI_PRODUCTS_LIMIT, "page": pg},
+                    headers=ISHIBASHI_BROWSER_HEADERS,
+                )
+                if r_fb.status_code == 200 and _ishibashi_response_looks_json(r_fb):
+                    try:
+                        fb_payload = r_fb.json()
+                        fb_all = fb_payload.get("products")
+                        if isinstance(fb_all, list):
+                            for p in fb_all:
+                                if not isinstance(p, dict):
+                                    continue
+                                h = p.get("handle")
+                                if not isinstance(h, str) or not h or h in seen_handles:
+                                    continue
+                                if _ishibashi_matches_keyword(
+                                    str(p.get("title") or ""),
+                                    str(p.get("vendor") or ""),
+                                    q,
+                                ):
+                                    merged.append(p)
+                                    seen_handles.add(h)
+                    except Exception:
+                        pass
+
+            out: list[dict[str, Any]] = []
+            for prod in merged:
+                raw = _ishibashi_product_to_raw(prod)
+                if raw is not None:
+                    out.append(raw)
+
+            logger.info(
+                "[Ishibashi] scrape success keyword=%r page=%s items=%s",
+                q,
+                pg,
+                len(out),
+            )
+            return out
+
+    except Exception as e:
+        line = (
+            f"[Ishibashi] scrape_ishibashi error | keyword={q!r} page={pg} | "
+            f"type={type(e).__name__} | details={str(e)}"
+        )
+        print(line, flush=True)
+        logger.error(line, exc_info=True)
+        if isinstance(e, httpx.HTTPStatusError):
+            resp = e.response
+            if resp is not None:
+                snippet = (resp.text or "")[:500].replace("\n", " ")
+                detail = (
+                    f"[Ishibashi] HTTPStatusError status_code={resp.status_code} "
+                    f"url={resp.url} body_snippet={snippet!r}"
+                )
+                print(detail, flush=True)
+                logger.error(detail)
+        elif isinstance(e, httpx.TimeoutException):
+            detail = "[Ishibashi] Timeout — 请求石桥乐器超时"
+            print(detail, flush=True)
+            logger.error(detail)
+        elif isinstance(e, httpx.RequestError):
+            detail = f"[Ishibashi] RequestError: {e!r}"
+            print(detail, flush=True)
+            logger.error(detail)
+        tb = traceback.format_exc()
+        print(f"[Ishibashi] full traceback:\n{tb}", flush=True)
+        return []
+
+
+async def _safe_scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
+    """供 ``/api/search`` 合并：石桥超时或异常时返回空列表，不拖累其它平台。"""
+    q = keyword.strip()
+    if not q:
+        return []
+    pg = max(1, int(page))
+    try:
+        return await asyncio.wait_for(scrape_ishibashi(q, pg), timeout=26.0)
+    except asyncio.TimeoutError:
+        logger.warning("[Ishibashi] asyncio.wait_for timeout (26s) keyword=%r page=%s", q, pg)
+        return []
+    except Exception as e:
+        logger.error("[Ishibashi] _safe_scrape_ishibashi unexpected: %s", e, exc_info=True)
+        return []
+
+
 def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
     """Reverb HAL listing 的 ``price`` 对象 → 金额与 ISO 货币。"""
     price_obj = listing.get("price")
@@ -689,7 +978,7 @@ def _unified_row(
 
 
 def _normalize_url_for_dedup(url: str) -> str:
-    """合并 Reverb / Digimart / GuitarGuitar 时按 URL 去重用的规范化键（scheme/host 小写、去尾斜杠）。"""
+    """合并多平台结果时按 URL 去重用的规范化键（scheme/host 小写、去尾斜杠）。"""
     raw = (url or "").strip()
     if not raw:
         return ""
@@ -773,21 +1062,22 @@ async def search_reverb(
 
 @app.get("/api/search")
 async def api_search(
-    q: str = Query("", description="搜索关键词；并发查询 Reverb、Digimart、GuitarGuitar"),
-    page: int = Query(1, ge=1, description="页码，从 1 开始；三方使用同一页码参数"),
+    q: str = Query("", description="搜索关键词；并发查询 Reverb、Digimart、GuitarGuitar、Ishibashi"),
+    page: int = Query(1, ge=1, description="页码，从 1 开始；四方使用同一页码参数"),
 ) -> dict[str, Any]:
     """
     ``asyncio.gather`` 并发：``_safe_fetch_reverb_listings_for_merge``、``scrape_digimart``、
-    ``scrape_guitarguitar``。Reverb / Digimart / GuitarGuitar 任一失败时该源返回空列表，
+    ``scrape_guitarguitar``、``_safe_scrape_ishibashi``。任一源失败时该源返回空列表，
     不阻断其它平台；合并结果按规范化 ``url`` 去重。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
-    ``url`` / ``condition``（``全新`` 或 ``二手``；GuitarGuitar 条目标记为 ``二手``）。
+    ``url`` / ``condition``（``全新`` 或 ``二手``）。
 
     Digimart 仅在第 1 页抓取（避免 SSR 多页重复）；GuitarGuitar 使用
     ``/search/?Query=…&page=…`` 并在后端按标题关键词与二手文案过滤。
+    Ishibashi：Shopify ``search.json``（若非 JSON 则 ``search/suggest.json`` + ``products.json`` 筛选）。
 
-    汇价：Frankfurter；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
+    汇价：Frankfurter（含 JPY→CNY）；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
     ``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
     q_clean = q.strip()
@@ -796,15 +1086,16 @@ async def api_search(
 
     page_no = max(1, page)
     logger.info(
-        "[api/search] start concurrent Reverb+Digimart+GuitarGuitar query=%r page=%s",
+        "[api/search] start concurrent Reverb+Digimart+GuitarGuitar+Ishibashi query=%r page=%s",
         q_clean,
         page_no,
     )
 
-    rev_out, digi_out, gg_out = await asyncio.gather(
+    rev_out, digi_out, gg_out, ishi_out = await asyncio.gather(
         _safe_fetch_reverb_listings_for_merge(q_clean, page_no),
         scrape_digimart(q_clean, page_no),
         scrape_guitarguitar(q_clean, page_no),
+        _safe_scrape_ishibashi(q_clean, page_no),
         return_exceptions=True,
     )
 
@@ -828,9 +1119,20 @@ async def api_search(
                 else None
             ),
         )
+    if not isinstance(ishi_out, list):
+        logger.error(
+            "[api/search] Ishibashi task returned non-list (unexpected): %r",
+            ishi_out,
+            exc_info=(
+                (type(ishi_out), ishi_out, ishi_out.__traceback__)
+                if isinstance(ishi_out, BaseException)
+                else None
+            ),
+        )
 
     digi_raw: list[dict[str, Any]] = digi_out if isinstance(digi_out, list) else []
     gg_raw: list[dict[str, Any]] = gg_out if isinstance(gg_out, list) else []
+    ishi_raw: list[dict[str, Any]] = ishi_out if isinstance(ishi_out, list) else []
 
     if not isinstance(rev_out, list):
         if isinstance(rev_out, BaseException):
@@ -843,13 +1145,14 @@ async def api_search(
     else:
         raw_rev = rev_out
 
-    if not raw_rev and not digi_raw and not gg_raw:
+    if not raw_rev and not digi_raw and not gg_raw and not ishi_raw:
         return {"query": q_clean, "page": page_no, "has_more": False, "results": []}
 
     has_more = (
         (len(raw_rev) >= REVERB_PER_PAGE)
         or (page_no == 1 and len(digi_raw) >= DIGIMART_PER_PAGE)
         or (len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
+        or (len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
     )
 
     currencies: set[str] = {"USD"}
@@ -857,7 +1160,7 @@ async def api_search(
         _, cur = _reverb_amount_currency(listing)
         if cur:
             currencies.add(cur)
-    if digi_raw:
+    if digi_raw or ishi_raw:
         currencies.add("JPY")
     if gg_raw:
         currencies.add("GBP")
@@ -934,6 +1237,26 @@ async def api_search(
             )
         )
 
+    for ib in ishi_raw:
+        jpy_ib = float(ib["jpy"])
+        pcny_ib: float | None = None
+        if "JPY" in rates_map:
+            pcny_ib = jpy_ib * rates_map["JPY"]
+        ib_cond = str(ib.get("condition") or "二手")
+        if ib_cond not in ("全新", "二手"):
+            ib_cond = "二手"
+        results.append(
+            _unified_row(
+                title=str(ib["title"]),
+                image=ib.get("image"),
+                url=str(ib["url"]),
+                source="Ishibashi",
+                price_cny=pcny_ib,
+                usd_to_cny=usd_to_cny,
+                condition=ib_cond,
+            )
+        )
+
     before_dedupe = len(results)
     results = _dedupe_results_preserve_order(results)
     if before_dedupe > len(results):
@@ -946,14 +1269,16 @@ async def api_search(
     n_rev = sum(1 for row in results if row.get("source") == "Reverb")
     n_dig = sum(1 for row in results if row.get("source") == "Digimart")
     n_gg = sum(1 for row in results if row.get("source") == "GuitarGuitar")
+    n_ishi = sum(1 for row in results if row.get("source") == "Ishibashi")
     logger.info(
-        "[api/search] done query=%r page=%s total=%s (reverb=%s digimart=%s guitarguitar=%s) has_more=%s",
+        "[api/search] done query=%r page=%s total=%s (reverb=%s digimart=%s guitarguitar=%s ishibashi=%s) has_more=%s",
         q_clean,
         page_no,
         len(results),
         n_rev,
         n_dig,
         n_gg,
+        n_ishi,
         has_more,
     )
 

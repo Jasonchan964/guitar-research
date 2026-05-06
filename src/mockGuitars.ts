@@ -1,4 +1,4 @@
-/** ``GET /api/search`` 返回的单条结果（Reverb + Digimart + GuitarGuitar 合并） */
+/** ``GET /api/search`` 返回的单条结果（Reverb + Digimart + GuitarGuitar + Ishibashi 合并） */
 export type UnifiedListing = {
   title: string
   image: string | null
