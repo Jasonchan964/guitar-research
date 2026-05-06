@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
-`GET /api/search` 并发请求 Reverb、Digimart 与 GuitarGuitar（Pre-Owned）；单方失败返回空列表，不影响其余平台。
+`GET /api/search` 并发请求 Reverb、Digimart 与 GuitarGuitar（站点全局搜索筛选二手）；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
 
@@ -250,14 +250,47 @@ def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
 
 def _guitarguitar_search_url(keyword: str, page: int) -> str:
     """
-    GuitarGuitar Pre-Owned 搜索 URL。
+    GuitarGuitar 全局搜索 URL（SSR 商品列表）。
 
-    分页必须用路径 ``/pre-owned/page-N/``；单独使用 ``?page=N`` 查询参数时列表仍停留在第 1 页。
+    必须与站点搜索表单一致使用查询参数 ``Query``；使用 ``q`` 时服务端通常不渲染 ``a.product`` 列表，
+    易被误认为「关键词无效」而只看到导航等无关内容。
     """
     enc = quote_plus(keyword.strip())
-    if page <= 1:
-        return f"{GUITARGUITAR_ORIGIN}/pre-owned/?Query={enc}"
-    return f"{GUITARGUITAR_ORIGIN}/pre-owned/page-{page}/?Query={enc}"
+    pg = max(1, int(page))
+    return f"{GUITARGUITAR_ORIGIN}/search/?Query={enc}&page={pg}"
+
+
+def _guitarguitar_keyword_tokens(keyword: str) -> list[str]:
+    """搜索词拆分为核心词（小写、长度 > 1）；无可用词时退回整条短语（若长度足够）。"""
+    parts = [w.lower() for w in keyword.split() if len(w) > 1]
+    if parts:
+        return parts
+    core = keyword.strip().lower()
+    return [core] if len(core) > 1 else []
+
+
+def _guitarguitar_title_matches_tokens(title: str, tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    tl = title.lower()
+    return any(tok in tl for tok in tokens)
+
+
+def _guitarguitar_card_is_pre_owned(anchor: Any, title: str) -> bool:
+    """
+    列表卡片是否表现为二手：合并标题、锚点 ``title``、整张卡片可见文案（标题/闪光标签/价格区等），
+    检测 ``pre-owned``、``second hand`` 或独立单词 ``used``（正则边界，避免 ``unused``）。
+    """
+    blob = " ".join(
+        [
+            title,
+            (anchor.get("title") or "").strip(),
+            anchor.get_text(" ", strip=True),
+        ]
+    ).lower()
+    if "pre-owned" in blob or "second hand" in blob:
+        return True
+    return bool(re.search(r"\bused\b", blob))
 
 
 def _parse_gbp_price_text(price_blob: str) -> float | None:
@@ -325,7 +358,7 @@ def _guitarguitar_upgrade_image_url(absolute_url: str) -> str:
 
 
 def _guitarguitar_anchor_to_raw(anchor: Any) -> dict[str, Any] | None:
-    """单条 ``a.product``（Pre-Owned 列表）→ 标题、图片、英镑价格、链接。"""
+    """单条 ``a.product``（全局搜索 ``/search/`` 列表）→ 标题、图片、英镑价格、链接。"""
     href = (anchor.get("href") or "").strip()
     if not href or "/product/" not in href:
         return None
@@ -364,7 +397,6 @@ def _guitarguitar_anchor_to_raw(anchor: Any) -> dict[str, Any] | None:
         "image": image,
         "gbp": price_gbp,
         "url": url,
-        "condition": "二手",
     }
 
 
@@ -486,14 +518,20 @@ async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
 
 async def scrape_guitarguitar(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
-    异步抓取 GuitarGuitar Pre-Owned 搜索列表（与站点 HTML ``a.product`` 解析一致）。
+    抓取 GuitarGuitar 全局搜索 ``/search/?Query=…`` 的 ``a.product`` 列表。
 
-    商品图在 ``_guitarguitar_anchor_to_raw`` 中经 ``_guitarguitar_upgrade_image_url`` 做高清化。
-    异常或超时返回空列表，不向外抛错。
+    解析后经两道过滤：（1）标题须命中用户搜索核心词；（2）卡片须表现为二手（Pre-Owned /
+    Second Hand / ``used``）。商品图在 ``_guitarguitar_anchor_to_raw`` 中经
+    ``_guitarguitar_upgrade_image_url`` 高清化。异常或超时返回空列表，不向外抛错。
     """
     q = keyword.strip()
     if not q:
         logger.info("[GuitarGuitar] scrape skipped (empty keyword)")
+        return []
+
+    tokens = _guitarguitar_keyword_tokens(q)
+    if not tokens:
+        logger.info("[GuitarGuitar] scrape skipped (no keyword tokens len>1): %r", q)
         return []
 
     pg = max(1, int(page))
@@ -508,16 +546,35 @@ async def scrape_guitarguitar(keyword: str, page: int = 1) -> list[dict[str, Any
         soup = BeautifulSoup(r.text, "html.parser")
         blocks = soup.select(".product-list-products a.product")
         out: list[dict[str, Any]] = []
+        parsed_ok = 0
+        dropped_kw = 0
+        dropped_po = 0
         for anchor in blocks[:GUITARGUITAR_MAX_PARSE]:
-            raw = _guitarguitar_anchor_to_raw(anchor)
-            if raw is not None:
+            try:
+                raw = _guitarguitar_anchor_to_raw(anchor)
+                if raw is None:
+                    continue
+                parsed_ok += 1
+                title = str(raw.get("title") or "")
+                if not _guitarguitar_title_matches_tokens(title, tokens):
+                    dropped_kw += 1
+                    continue
+                if not _guitarguitar_card_is_pre_owned(anchor, title):
+                    dropped_po += 1
+                    continue
                 out.append(raw)
+            except Exception:
+                continue
 
         logger.info(
-            "[GuitarGuitar] scrape success keyword=%r page=%s parsed_items=%s",
+            "[GuitarGuitar] scrape success keyword=%r page=%s kept=%s "
+            "(parsed=%s dropped_kw=%s dropped_pre_owned=%s)",
             q,
             pg,
             len(out),
+            parsed_ok,
+            dropped_kw,
+            dropped_po,
         )
         if not out and len(r.text or "") > 500:
             logger.warning(
@@ -725,9 +782,10 @@ async def api_search(
     不阻断其它平台；合并结果按规范化 ``url`` 去重。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
-    ``url`` / ``condition``（``全新`` 或 ``二手``；GuitarGuitar Pre-Owned 均为 ``二手``）。
+    ``url`` / ``condition``（``全新`` 或 ``二手``；GuitarGuitar 条目标记为 ``二手``）。
 
-    Digimart 仅在第 1 页抓取（避免 SSR 多页重复）；GuitarGuitar 使用路径分页 ``/pre-owned/page-N/``。
+    Digimart 仅在第 1 页抓取（避免 SSR 多页重复）；GuitarGuitar 使用
+    ``/search/?Query=…&page=…`` 并在后端按标题关键词与二手文案过滤。
 
     汇价：Frankfurter；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
     ``price_usd`` = ``price_cny / (1 USD→CNY)``。
