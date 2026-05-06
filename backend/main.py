@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
-`GET /api/search` 并发请求 Reverb、Digimart、GuitarGuitar、Ishibashi（石桥乐器国际站 Shopify）与 Swee Lee（新加坡站 Shopify）；单方失败返回空列表，不影响其余平台。
+`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
 
@@ -84,6 +84,10 @@ ISHIBASHI_SUGGEST_LIMIT = 24
 ISHIBASHI_PRODUCTS_LIMIT = 50
 # ``has_more`` 启发式：石桥单页接近「满页」时认为可能还有下一页
 ISHIBASHI_HAS_MORE_HINT = 24
+# ``/api/search`` 可选平台（小写 slug，与前端 ``platforms`` 参数一致）
+ALL_PLATFORM_SLUGS: frozenset[str] = frozenset(
+    ("reverb", "digimart", "guitarguitar", "ishibashi", "sweelee")
+)
 # 请求侧强制日元定价，降低按 IP 自动切货币的概率（与 Shopify ``currency`` 查询参数配合）
 ISHIBASHI_FORCE_CURRENCY_PARAMS = {"currency": "JPY"}
 ISHIBASHI_BROWSER_HEADERS = {
@@ -1454,6 +1458,61 @@ def _dedupe_results_preserve_order(rows: list[dict[str, Any]]) -> list[dict[str,
     return out
 
 
+def _normalize_platform_slug_token(token: str) -> str | None:
+    """
+    将 ``platforms`` 查询串中的片段规范为 ``ALL_PLATFORM_SLUGS`` 之一；无法识别则 ``None``。
+    允许去掉空格与常见分隔符（如 ``swee lee`` → ``sweelee``）。
+    """
+    s = re.sub(r"[\s_-]+", "", (token or "").strip().lower())
+    if not s:
+        return None
+    if s in ALL_PLATFORM_SLUGS:
+        return s
+    return None
+
+
+def parse_platforms_param(raw: str) -> set[str]:
+    """
+    解析 ``platforms``：``all`` 或未传有效列表时表示五站全开；否则按逗号拆分并去重。
+    若调用方显式给出了**非 all** 的列表但无任何可识别 slug，返回空集（由路由层返回 400）。
+    """
+    s = (raw or "").strip().lower()
+    if not s or s == "all":
+        return set(ALL_PLATFORM_SLUGS)
+    parts = [p for p in s.split(",") if p.strip()]
+    if not parts:
+        return set(ALL_PLATFORM_SLUGS)
+    if any(p.strip().lower() == "all" for p in parts):
+        return set(ALL_PLATFORM_SLUGS)
+    out: set[str] = set()
+    for p in parts:
+        slug = _normalize_platform_slug_token(p)
+        if slug:
+            out.add(slug)
+    return out
+
+
+def normalize_condition_param(raw: str) -> str:
+    c = (raw or "all").strip().lower()
+    if c in ("all", "new", "used"):
+        return c
+    return "all"
+
+
+def filter_results_by_condition(rows: list[dict[str, Any]], condition: str) -> list[dict[str, Any]]:
+    """
+    合并去重后的成色过滤：``new`` → 仅 ``全新``；``used`` → 仅 ``二手``；``all`` 不变。
+    """
+    c = normalize_condition_param(condition)
+    if c == "all":
+        return rows
+    if c == "new":
+        return [r for r in rows if str(r.get("condition") or "") == "全新"]
+    if c == "used":
+        return [r for r in rows if str(r.get("condition") or "") == "二手"]
+    return rows
+
+
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -1512,113 +1571,173 @@ async def api_search(
     q: str = Query(
         "",
         description=(
-            "搜索关键词；并发查询 Reverb、Digimart、GuitarGuitar、Ishibashi、Swee Lee"
+            "搜索关键词；按 ``platforms`` 仅并发抓取勾选的平台（见该参数说明）"
         ),
     ),
     page: int = Query(1, ge=1, description="页码，从 1 开始；五方使用同一页码参数"),
+    platforms: str = Query(
+        "all",
+        description='平台列表：``all`` 为五站全开；否则逗号分隔 slug，如 ``reverb,digimart``',
+    ),
+    condition: str = Query(
+        "all",
+        description='成色：``all`` | ``new``（仅全新）| ``used``（仅二手），在合并去重后过滤',
+    ),
 ) -> dict[str, Any]:
     """
-    ``asyncio.gather`` 并发：``_safe_fetch_reverb_listings_for_merge``、``scrape_digimart``、
-    ``scrape_guitarguitar``、``_safe_scrape_ishibashi``、``_safe_scrape_sweelee``。任一源失败时
-    该源返回空列表，不阻断其它平台；合并结果按规范化 ``url`` 去重。
+    按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
+
+    合并结果按规范化 ``url`` 去重后，再按 ``condition`` 做二次过滤（``全新`` / ``二手``）。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
     ``url`` / ``condition``（``全新`` 或 ``二手``）。
-
-    Digimart 仅在第 1 页抓取（避免 SSR 多页重复）；GuitarGuitar 使用
-    ``/search/?Query=…&page=…`` 并在后端按标题关键词与二手文案过滤。
-    Ishibashi：Shopify ``search.json``（若非 JSON 则 ``search/suggest.json`` + ``products.json`` 筛选）。
-    Swee Lee：同上策略；``search.json`` 带 ``currency=SGD``；汇价按 JSON 实际货币（ ``SGD`` / ``CNY`` 等）。
-
-    汇价：Frankfurter（含 JPY / SGD→CNY）；GBP→CNY 优先接口结果，缺省时 ``GBP_CNY_RATE``（默认 9.15）。
-    ``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
     q_clean = q.strip()
     if not q_clean:
         return {"query": "", "page": 1, "has_more": False, "results": []}
 
     page_no = max(1, page)
+    selected = parse_platforms_param(platforms)
+    raw_plat = (platforms or "").strip()
+    if raw_plat and raw_plat.lower() != "all" and not selected:
+        raise HTTPException(
+            status_code=400,
+            detail="请至少选择一个有效的搜索平台（reverb,digimart,guitarguitar,ishibashi,sweelee）",
+        )
+    cond_norm = normalize_condition_param(condition)
+
     logger.info(
-        "[api/search] start concurrent Reverb+Digimart+GuitarGuitar+Ishibashi+SweeLee query=%r page=%s",
+        "[api/search] start query=%r page=%s platforms=%s condition=%s",
         q_clean,
         page_no,
+        sorted(selected),
+        cond_norm,
     )
 
-    rev_out, digi_out, gg_out, ishi_out, swee_out = await asyncio.gather(
-        _safe_fetch_reverb_listings_for_merge(q_clean, page_no),
-        scrape_digimart(q_clean, page_no),
-        scrape_guitarguitar(q_clean, page_no),
-        _safe_scrape_ishibashi(q_clean, page_no),
-        _safe_scrape_sweelee(q_clean, page_no),
-        return_exceptions=True,
-    )
+    coros: list[Any] = []
+    labels: list[str] = []
 
-    if not isinstance(digi_out, list):
-        logger.error(
-            "[api/search] Digimart task returned non-list (unexpected): %r",
-            digi_out,
-            exc_info=(
-                (type(digi_out), digi_out, digi_out.__traceback__)
-                if isinstance(digi_out, BaseException)
-                else None
-            ),
-        )
-    if not isinstance(gg_out, list):
-        logger.error(
-            "[api/search] GuitarGuitar task returned non-list (unexpected): %r",
-            gg_out,
-            exc_info=(
-                (type(gg_out), gg_out, gg_out.__traceback__)
-                if isinstance(gg_out, BaseException)
-                else None
-            ),
-        )
-    if not isinstance(ishi_out, list):
-        logger.error(
-            "[api/search] Ishibashi task returned non-list (unexpected): %r",
-            ishi_out,
-            exc_info=(
-                (type(ishi_out), ishi_out, ishi_out.__traceback__)
-                if isinstance(ishi_out, BaseException)
-                else None
-            ),
-        )
-    if not isinstance(swee_out, list):
-        logger.error(
-            "[api/search] Swee Lee task returned non-list (unexpected): %r",
-            swee_out,
-            exc_info=(
-                (type(swee_out), swee_out, swee_out.__traceback__)
-                if isinstance(swee_out, BaseException)
-                else None
-            ),
+    if "reverb" in selected:
+        coros.append(_safe_fetch_reverb_listings_for_merge(q_clean, page_no))
+        labels.append("reverb")
+    if "digimart" in selected:
+        coros.append(scrape_digimart(q_clean, page_no))
+        labels.append("digimart")
+    if "guitarguitar" in selected:
+        coros.append(scrape_guitarguitar(q_clean, page_no))
+        labels.append("guitarguitar")
+    if "ishibashi" in selected:
+        coros.append(_safe_scrape_ishibashi(q_clean, page_no))
+        labels.append("ishibashi")
+    if "sweelee" in selected:
+        coros.append(_safe_scrape_sweelee(q_clean, page_no))
+        labels.append("sweelee")
+
+    if not coros:
+        raise HTTPException(
+            status_code=400,
+            detail="请至少选择一个有效的搜索平台",
         )
 
-    digi_raw: list[dict[str, Any]] = digi_out if isinstance(digi_out, list) else []
-    gg_raw: list[dict[str, Any]] = gg_out if isinstance(gg_out, list) else []
-    ishi_raw: list[dict[str, Any]] = ishi_out if isinstance(ishi_out, list) else []
-    swee_raw: list[dict[str, Any]] = swee_out if isinstance(swee_out, list) else []
+    gathered = await asyncio.gather(*coros, return_exceptions=True)
 
-    if not isinstance(rev_out, list):
-        if isinstance(rev_out, BaseException):
-            logger.error(
-                "[api/search] Reverb task raised unexpectedly (should be empty list): %r",
-                rev_out,
-                exc_info=(type(rev_out), rev_out, rev_out.__traceback__),
-            )
-        raw_rev: list[dict[str, Any]] = []
-    else:
-        raw_rev = rev_out
+    raw_rev: list[dict[str, Any]] = []
+    digi_raw: list[dict[str, Any]] = []
+    gg_raw: list[dict[str, Any]] = []
+    ishi_raw: list[dict[str, Any]] = []
+    swee_raw: list[dict[str, Any]] = []
+
+    for name, out in zip(labels, gathered):
+        if name == "reverb":
+            if isinstance(out, list):
+                raw_rev = out
+            else:
+                if isinstance(out, BaseException):
+                    logger.error(
+                        "[api/search] Reverb task raised unexpectedly: %r",
+                        out,
+                        exc_info=(type(out), out, out.__traceback__),
+                    )
+                else:
+                    logger.error(
+                        "[api/search] Reverb task returned non-list: %r",
+                        out,
+                    )
+            continue
+        if name == "digimart":
+            if isinstance(out, list):
+                digi_raw = out
+            else:
+                logger.error(
+                    "[api/search] Digimart task returned non-list (unexpected): %r",
+                    out,
+                    exc_info=(
+                        (type(out), out, out.__traceback__)
+                        if isinstance(out, BaseException)
+                        else None
+                    ),
+                )
+            continue
+        if name == "guitarguitar":
+            if isinstance(out, list):
+                gg_raw = out
+            else:
+                logger.error(
+                    "[api/search] GuitarGuitar task returned non-list (unexpected): %r",
+                    out,
+                    exc_info=(
+                        (type(out), out, out.__traceback__)
+                        if isinstance(out, BaseException)
+                        else None
+                    ),
+                )
+            continue
+        if name == "ishibashi":
+            if isinstance(out, list):
+                ishi_raw = out
+            else:
+                logger.error(
+                    "[api/search] Ishibashi task returned non-list (unexpected): %r",
+                    out,
+                    exc_info=(
+                        (type(out), out, out.__traceback__)
+                        if isinstance(out, BaseException)
+                        else None
+                    ),
+                )
+            continue
+        if name == "sweelee":
+            if isinstance(out, list):
+                swee_raw = out
+            else:
+                logger.error(
+                    "[api/search] Swee Lee task returned non-list (unexpected): %r",
+                    out,
+                    exc_info=(
+                        (type(out), out, out.__traceback__)
+                        if isinstance(out, BaseException)
+                        else None
+                    ),
+                )
 
     if not raw_rev and not digi_raw and not gg_raw and not ishi_raw and not swee_raw:
-        return {"query": q_clean, "page": page_no, "has_more": False, "results": []}
+        return {
+            "query": q_clean,
+            "page": page_no,
+            "has_more": False,
+            "results": [],
+        }
 
     has_more = (
-        (len(raw_rev) >= REVERB_PER_PAGE)
-        or (page_no == 1 and len(digi_raw) >= DIGIMART_PER_PAGE)
-        or (len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
-        or (len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
-        or (len(swee_raw) >= SWEELEE_HAS_MORE_HINT)
+        ("reverb" in selected and len(raw_rev) >= REVERB_PER_PAGE)
+        or (
+            "digimart" in selected
+            and page_no == 1
+            and len(digi_raw) >= DIGIMART_PER_PAGE
+        )
+        or ("guitarguitar" in selected and len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
+        or ("ishibashi" in selected and len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
+        or ("sweelee" in selected and len(swee_raw) >= SWEELEE_HAS_MORE_HINT)
     )
 
     currencies: set[str] = {"USD"}
@@ -1761,6 +1880,8 @@ async def api_search(
             before_dedupe,
             len(results),
         )
+
+    results = filter_results_by_condition(results, cond_norm)
 
     n_rev = sum(1 for row in results if row.get("source") == "Reverb")
     n_dig = sum(1 for row in results if row.get("source") == "Digimart")

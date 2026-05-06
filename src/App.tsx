@@ -117,6 +117,168 @@ type SearchClusterProps = {
   onSubmitSearch: () => void
 }
 
+const PLATFORM_IDS = ['reverb', 'digimart', 'guitarguitar', 'ishibashi', 'sweelee'] as const
+type PlatformId = (typeof PLATFORM_IDS)[number]
+
+type ConditionFilter = 'all' | 'new' | 'used'
+
+const PLATFORM_META: Record<
+  PlatformId,
+  { label: string; short: string; onClass: string; offClass: string }
+> = {
+  reverb: {
+    label: 'Reverb',
+    short: 'Reverb',
+    onClass: 'border-orange-500/90 bg-orange-500 text-white shadow-sm ring-1 ring-orange-500/30',
+    offClass:
+      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+  },
+  digimart: {
+    label: 'Digimart',
+    short: 'Digimart',
+    onClass: 'border-sky-600/90 bg-sky-600 text-white shadow-sm ring-1 ring-sky-600/30',
+    offClass:
+      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+  },
+  guitarguitar: {
+    label: 'GuitarGuitar',
+    short: 'GG',
+    onClass: 'border-rose-600/90 bg-rose-600 text-white shadow-sm ring-1 ring-rose-600/30',
+    offClass:
+      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+  },
+  ishibashi: {
+    label: 'Ishibashi',
+    short: 'Ishibashi',
+    onClass: 'border-red-700/90 bg-red-700 text-white shadow-sm ring-1 ring-red-700/30',
+    offClass:
+      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+  },
+  sweelee: {
+    label: 'Swee Lee',
+    short: 'Swee Lee',
+    onClass: 'border-emerald-600/90 bg-emerald-600 text-white shadow-sm ring-1 ring-emerald-600/30',
+    offClass:
+      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+  },
+}
+
+const CONDITION_META: Record<
+  ConditionFilter,
+  { label: string; aria: string }
+> = {
+  all: { label: '全部', aria: '全部成色' },
+  new: { label: '只看全新', aria: '仅显示全新' },
+  used: { label: '只看二手', aria: '仅显示二手' },
+}
+
+function defaultPlatformsSelected(): Record<PlatformId, boolean> {
+  return {
+    reverb: true,
+    digimart: true,
+    guitarguitar: true,
+    ishibashi: true,
+    sweelee: true,
+  }
+}
+
+type FilterToolbarProps = {
+  selectedPlatforms: Record<PlatformId, boolean>
+  onTogglePlatform: (id: PlatformId) => void
+  condition: ConditionFilter
+  onConditionChange: (c: ConditionFilter) => void
+  disabled?: boolean
+  compact?: boolean
+}
+
+/** 平台多选 + 成色分段；移动端 2 列药丸，桌面端自适应换行 */
+function FilterToolbar({
+  selectedPlatforms,
+  onTogglePlatform,
+  condition,
+  onConditionChange,
+  disabled,
+  compact,
+}: FilterToolbarProps) {
+  return (
+    <div
+      className={`w-full rounded-2xl border border-slate-200/80 bg-white/80 p-3 shadow-sm backdrop-blur-sm dark:border-slate-700/90 dark:bg-slate-900/70 ${
+        compact ? 'max-w-2xl' : ''
+      }`}
+      aria-label="搜索筛选"
+    >
+      <div className={`flex flex-col ${compact ? 'gap-3' : 'gap-4'}`}>
+        <div>
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+            平台来源
+          </p>
+          <ul className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:gap-2">
+            {PLATFORM_IDS.map((id) => {
+              const on = selectedPlatforms[id]
+              const meta = PLATFORM_META[id]
+              return (
+                <li key={id} className="min-w-0 sm:flex-initial">
+                  <button
+                    type="button"
+                    disabled={disabled}
+                    aria-pressed={on}
+                    onClick={() => onTogglePlatform(id)}
+                    className={`inline-flex w-full min-h-[2.25rem] items-center justify-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold tracking-tight transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-0 ${
+                      on ? meta.onClass : meta.offClass
+                    }`}
+                  >
+                    <span
+                      className="inline-flex h-4 w-4 items-center justify-center rounded border border-current text-[10px] leading-none"
+                      aria-hidden
+                    >
+                      {on ? '✓' : ''}
+                    </span>
+                    <span className="truncate sm:hidden">{meta.short}</span>
+                    <span className="hidden truncate sm:inline">{meta.label}</span>
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+
+        <div className="border-t border-slate-200/70 pt-3 dark:border-slate-700/80">
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+            成色
+          </p>
+          <div
+            className="flex w-full rounded-xl border border-slate-200/90 bg-slate-100/90 p-1 dark:border-slate-600 dark:bg-slate-800/90"
+            role="tablist"
+            aria-label="成色筛选"
+          >
+            {(Object.keys(CONDITION_META) as ConditionFilter[]).map((key) => {
+              const active = condition === key
+              const m = CONDITION_META[key]
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  disabled={disabled}
+                  onClick={() => onConditionChange(key)}
+                  className={`relative flex-1 rounded-lg px-2 py-2 text-center text-xs font-semibold transition-colors sm:text-sm ${
+                    active
+                      ? 'bg-white text-slate-900 shadow-sm ring-1 ring-slate-200/90 dark:bg-slate-950 dark:text-slate-50 dark:ring-slate-600'
+                      : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200'
+                  } disabled:cursor-not-allowed disabled:opacity-50`}
+                >
+                  {m.label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /** 当前页 ±2；无更多页时右侧不延伸 */
 type SortOrder = 'default' | 'price_asc' | 'price_desc'
 
@@ -405,6 +567,11 @@ function SearchCluster({
   )
 }
 
+type ActiveSearchFilters = {
+  platformIds: PlatformId[]
+  condition: ConditionFilter
+}
+
 function App() {
   const [query, setQuery] = useState('')
   const [submittedQuery, setSubmittedQuery] = useState<string | null>(null)
@@ -414,6 +581,12 @@ function App() {
   const [sortOrder, setSortOrder] = useState<SortOrder>('default')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const [selectedPlatforms, setSelectedPlatforms] = useState<Record<PlatformId, boolean>>(
+    () => defaultPlatformsSelected(),
+  )
+  const [conditionFilter, setConditionFilter] = useState<ConditionFilter>('all')
+  const [activeFilters, setActiveFilters] = useState<ActiveSearchFilters | null>(null)
 
   const displayedListings = useMemo(
     () => sortListingsByOrder(listings, sortOrder),
@@ -453,28 +626,60 @@ function App() {
 
   const rateReady = !rateLoading && exchangeRate != null && !rateError
 
+  const enabledPlatformIds = useMemo(
+    () => PLATFORM_IDS.filter((id) => selectedPlatforms[id]),
+    [selectedPlatforms],
+  )
+
+  const togglePlatform = (id: PlatformId) => {
+    setSelectedPlatforms((prev) => ({ ...prev, [id]: !prev[id] }))
+  }
+
   const fetchSearchPage = async (q: string, page: number) => {
     const trimmed = q.trim()
     if (!trimmed) return
+
+    if (enabledPlatformIds.length === 0) {
+      setError('请至少选择一个平台进行搜索')
+      return
+    }
 
     setListings([])
     setLoading(true)
     setError(null)
 
     try {
+      const platformsParam =
+        enabledPlatformIds.length === PLATFORM_IDS.length ? 'all' : enabledPlatformIds.join(',')
+
       const qs = new URLSearchParams({
         q: trimmed,
         page: String(page),
+        platforms: platformsParam,
+        condition: conditionFilter,
       })
       const res = await fetch(`/api/search?${qs.toString()}`)
       if (!res.ok) {
         const text = await res.text()
-        throw new Error(text || `请求失败 (${res.status})`)
+        let msg = text || `请求失败 (${res.status})`
+        try {
+          const j = JSON.parse(text) as { detail?: unknown }
+          if (typeof j.detail === 'string') msg = j.detail
+          else if (Array.isArray(j.detail) && typeof j.detail[0]?.msg === 'string')
+            msg = j.detail.map((x: { msg: string }) => x.msg).join('；')
+        } catch {
+          /* use raw msg */
+        }
+        throw new Error(msg)
       }
       const data: UnifiedSearchApiResponse = await res.json()
       setListings(data.results)
       setCurrentPage(data.page ?? page)
       setHasMore(Boolean(data.has_more))
+      setActiveFilters({
+        platformIds: [...enabledPlatformIds],
+        condition: conditionFilter,
+      })
       requestAnimationFrame(() => {
         window.scrollTo({ top: 0, behavior: 'smooth' })
       })
@@ -503,6 +708,10 @@ function App() {
   const handlePageChange = (page: number) => {
     if (!submittedQuery || page < 1 || loading) return
     if (page === currentPage) return
+    if (enabledPlatformIds.length === 0) {
+      setError('请至少选择一个平台进行搜索')
+      return
+    }
     setCurrentPage(page)
     void fetchSearchPage(submittedQuery, page)
   }
@@ -575,14 +784,37 @@ function App() {
             loading={loading}
             onSubmitSearch={handleSubmitSearch}
           />
+          <div className="mx-auto mt-8 w-full max-w-2xl px-1">
+            <FilterToolbar
+              selectedPlatforms={selectedPlatforms}
+              onTogglePlatform={togglePlatform}
+              condition={conditionFilter}
+              onConditionChange={setConditionFilter}
+              disabled={loading}
+            />
+          </div>
         </main>
       ) : (
         <main className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
+          <div className="mx-auto mb-6 max-w-4xl">
+            <FilterToolbar
+              selectedPlatforms={selectedPlatforms}
+              onTogglePlatform={togglePlatform}
+              condition={conditionFilter}
+              onConditionChange={setConditionFilter}
+              disabled={loading}
+            />
+          </div>
           {submittedQuery && (
             <p className="mb-2 text-center text-sm text-slate-500 dark:text-slate-400">
-              Reverb + Digimart + GuitarGuitar + Ishibashi + Swee Lee 搜索结果 · 「{submittedQuery}」
-              {` · 第 ${currentPage} 页`}
-              {loading && ' · 加载中…'}
+              {(activeFilters
+                ? `${activeFilters.platformIds
+                    .map((id) => PLATFORM_META[id].label)
+                    .join(' + ')} · 成色：${CONDITION_META[activeFilters.condition].label}`
+                : '多平台搜索结果') +
+                ` · 「${submittedQuery}」` +
+                ` · 第 ${currentPage} 页` +
+                (loading ? ' · 加载中…' : '')}
             </p>
           )}
           {error && (
@@ -603,12 +835,12 @@ function App() {
             >
               <p className="min-h-[1.375rem] flex-1 text-center text-sm font-medium text-slate-500 dark:text-slate-400 sm:min-w-0 sm:text-left">
                 {loading && '正在搜寻全球货源…'}
-                {!loading && listings.length > 0 && (
-                  <>🔍 为您找到 {listings.length} 个全球淘琴结果</>
+                {!loading && displayedListings.length > 0 && (
+                  <>🔍 为您找到 {displayedListings.length} 个全球淘琴结果</>
                 )}
-                {!loading && listings.length === 0 && '未找到相关吉他，尝试换个关键词试试？'}
+                {!loading && displayedListings.length === 0 && '未找到相关吉他，尝试换个关键词试试？'}
               </p>
-              {listings.length > 0 && (
+              {displayedListings.length > 0 && (
                 <div className="flex shrink-0 flex-col items-center gap-1 sm:items-end">
                   <span className="text-[11px] font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500">
                     排序
