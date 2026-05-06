@@ -53,6 +53,10 @@ HAS_FRONTEND = (DIST_DIR / "index.html").is_file()
 
 DIGIMART_ORIGIN = "https://www.digimart.net"
 DIGIMART_SEARCH = f"{DIGIMART_ORIGIN}/search"
+# 搜索页表单：checkbox ``productTypes`` — ``NEW`` = 新品 / ``USED`` = 中古（与站内「新品」「中古」筛选项一致）
+# 分页：站点认 ``currentPage``；若仅用 ``page``/``currentPageNo`` 而不带 ``currentPage``，可能始终返回第 1 页列表
+DIGIMART_PRODUCT_TYPE_NEW = "NEW"
+DIGIMART_PRODUCT_TYPE_USED = "USED"
 # Reverb ``per_page`` 与列表「满页」启发式；Digimart 搜索页常见每页 20 条
 REVERB_PER_PAGE = 24
 DIGIMART_PER_PAGE = 20
@@ -572,18 +576,26 @@ def _reverb_condition_cn(listing: dict[str, Any]) -> str:
     return "二手"
 
 
-async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
+async def scrape_digimart(
+    keyword: str,
+    page: int = 1,
+    *,
+    condition: str = "all",
+) -> list[dict[str, Any]]:
     """
     异步抓取 Digimart 搜索页（与 ``test_digimart.py`` 同源解析逻辑）。
 
-    分页说明：Digimart 搜索页对服务端 GET 往往**只渲染第 1 页** HTML；即使用
-    ``currentPageNo`` / ``page`` 传参，列表内容仍可能与第 1 页相同。若在第 2 页及以后
-    继续抓取，会导致各页出现**同一批 Digimart 商品**，与 Reverb 真分页叠在一起形成
-    「分页重复」。因此 **page > 1 时不再请求 Digimart**，仅保留 Reverb 分页结果。
+    ``condition``（与 ``/api/search`` 一致，经 ``normalize_condition_param`` 规范）：
+    - ``all``：不按新品/中古筛选；
+    - ``new``：请求参数 ``productTypes=NEW``，服务端只返回「新品」库存，避免先抓整页再筛「全新」导致翻页被清空；
+    - ``used``：``productTypes=USED``，只抓中古。
 
-    第 1 页请求同时携带 ``currentPageNo`` 与 ``page``（站点不同入口可能认其中一种）。
+    分页：使用官网列表使用的 ``currentPage``（正整数页码）。勿单独依赖 ``page`` / ``currentPageNo``，
+    否则部分请求会静默回落到第 1 页，导致与其它平台合并后 URL 去重异常或翻页「跳空白页」。
 
-    网络/HTML 异常时返回空列表，不向外抛错，避免拖累 Reverb。
+    解析结果仍经 ``_digimart_condition_from_block`` 做二次归类。
+
+    网络/HTML 异常时返回空列表，不向外抛错，避免拖累其它平台。
     """
     q = keyword.strip()
     if not q:
@@ -591,16 +603,15 @@ async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
         return []
 
     pg = max(1, int(page))
-    if pg > 1:
-        logger.info(
-            "[Digimart] skip scrape for page=%s (SSR 仅首屏列表；避免与第 1 页重复)",
-            pg,
-        )
-        return []
+    cond = normalize_condition_param(condition)
 
-    logger.info("[Digimart] scrape start keyword=%r page=%s", q, pg)
+    logger.info("[Digimart] scrape start keyword=%r page=%s condition=%s", q, pg, cond)
     try:
-        params: dict[str, Any] = {"keyword": q, "currentPageNo": pg, "page": pg}
+        params: dict[str, Any] = {"keyword": q, "currentPage": pg}
+        if cond == "new":
+            params["productTypes"] = DIGIMART_PRODUCT_TYPE_NEW
+        elif cond == "used":
+            params["productTypes"] = DIGIMART_PRODUCT_TYPE_USED
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(
                 DIGIMART_SEARCH,
@@ -1550,7 +1561,10 @@ def _normalize_url_for_dedup(url: str) -> str:
 
 
 def _dedupe_results_preserve_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """同一响应内按 ``url`` 去重，保留首次出现顺序；无 URL 的条目不去重。"""
+    """
+    **单次** ``/api/search`` 响应内：对本次并发合并后的列表按规范化 ``url`` 去重，
+    保留首次出现顺序；无 URL 的条目不去重。不与历史页、前端缓存做跨请求去重。
+    """
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -1673,78 +1687,40 @@ async def search_reverb(
     return {"query": q.strip(), "results": results}
 
 
-@app.get("/api/search")
-async def api_search(
-    q: str = Query(
-        "",
-        description=(
-            "搜索关键词；按 ``platforms`` 仅并发抓取勾选的平台（见该参数说明）"
-        ),
-    ),
-    page: int = Query(1, ge=1, description="页码，从 1 开始；五方使用同一页码参数"),
-    platforms: str = Query(
-        "all",
-        description='平台列表：``all`` 为五站全开；否则逗号分隔 slug，如 ``reverb,digimart``',
-    ),
-    condition: str = Query(
-        "all",
-        description='成色：``all`` | ``new``（仅全新）| ``used``（仅二手），在合并去重后过滤',
-    ),
-) -> dict[str, Any]:
+# 请求第 N 页结果为空时，向后最多再尝试的页数（N+1 … N+API_SEARCH_EMPTY_PAGE_MAX_SKIP）
+API_SEARCH_EMPTY_PAGE_MAX_SKIP = 2
+
+
+async def _run_search_single_page(
+    q_clean: str,
+    fetch_page: int,
+    selected: set[str],
+    cond_norm: str,
+) -> tuple[list[dict[str, Any]], bool]:
     """
-    按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
-
-    合并结果按规范化 ``url`` 去重后，再按 ``condition`` 做二次过滤（``全新`` / ``二手``）。
-
-    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
-    ``url`` / ``condition``（``全新`` 或 ``二手``）。
+    抓取 ``fetch_page`` 对应的一屏：五路并发 → 合并 → **本次响应内** URL 去重 → 成色过滤。
+    返回 ``(results, has_more)``；若所有平台原始列表均为空则 ``([], False)``。
     """
-    q_clean = q.strip()
-    if not q_clean:
-        return {"query": "", "page": 1, "has_more": False, "results": []}
-
-    page_no = max(1, page)
-    selected = parse_platforms_param(platforms)
-    raw_plat = (platforms or "").strip()
-    if raw_plat and raw_plat.lower() != "all" and not selected:
-        raise HTTPException(
-            status_code=400,
-            detail="请至少选择一个有效的搜索平台（reverb,digimart,guitarguitar,ishibashi,sweelee）",
-        )
-    cond_norm = normalize_condition_param(condition)
-
-    logger.info(
-        "[api/search] start query=%r page=%s platforms=%s condition=%s",
-        q_clean,
-        page_no,
-        sorted(selected),
-        cond_norm,
-    )
+    pg = max(1, int(fetch_page))
 
     coros: list[Any] = []
     labels: list[str] = []
 
     if "reverb" in selected:
-        coros.append(_safe_fetch_reverb_listings_for_merge(q_clean, page_no))
+        coros.append(_safe_fetch_reverb_listings_for_merge(q_clean, pg))
         labels.append("reverb")
     if "digimart" in selected:
-        coros.append(scrape_digimart(q_clean, page_no))
+        coros.append(scrape_digimart(q_clean, pg, condition=cond_norm))
         labels.append("digimart")
     if "guitarguitar" in selected:
-        coros.append(scrape_guitarguitar(q_clean, page_no))
+        coros.append(scrape_guitarguitar(q_clean, pg))
         labels.append("guitarguitar")
     if "ishibashi" in selected:
-        coros.append(_safe_scrape_ishibashi(q_clean, page_no))
+        coros.append(_safe_scrape_ishibashi(q_clean, pg))
         labels.append("ishibashi")
     if "sweelee" in selected:
-        coros.append(_safe_scrape_sweelee(q_clean, page_no))
+        coros.append(_safe_scrape_sweelee(q_clean, pg))
         labels.append("sweelee")
-
-    if not coros:
-        raise HTTPException(
-            status_code=400,
-            detail="请至少选择一个有效的搜索平台",
-        )
 
     gathered = await asyncio.gather(*coros, return_exceptions=True)
 
@@ -1828,20 +1804,11 @@ async def api_search(
                 )
 
     if not raw_rev and not digi_raw and not gg_raw and not ishi_raw and not swee_raw:
-        return {
-            "query": q_clean,
-            "page": page_no,
-            "has_more": False,
-            "results": [],
-        }
+        return [], False
 
     has_more = (
         ("reverb" in selected and len(raw_rev) >= REVERB_PER_PAGE)
-        or (
-            "digimart" in selected
-            and page_no == 1
-            and len(digi_raw) >= DIGIMART_PER_PAGE
-        )
+        or ("digimart" in selected and len(digi_raw) >= DIGIMART_PER_PAGE)
         or ("guitarguitar" in selected and len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
         or ("ishibashi" in selected and len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
         or ("sweelee" in selected and len(swee_raw) >= SWEELEE_HAS_MORE_HINT)
@@ -1983,7 +1950,7 @@ async def api_search(
     results = _dedupe_results_preserve_order(results)
     if before_dedupe > len(results):
         logger.info(
-            "[api/search] deduped by url: %s -> %s rows",
+            "[api/search] deduped by url (single response): %s -> %s rows",
             before_dedupe,
             len(results),
         )
@@ -1996,10 +1963,10 @@ async def api_search(
     n_ishi = sum(1 for row in results if row.get("source") == "Ishibashi")
     n_swee = sum(1 for row in results if row.get("source") == "Swee Lee")
     logger.info(
-        "[api/search] done query=%r page=%s total=%s "
+        "[api/search] fetch_page=%s done query=%r total=%s "
         "(reverb=%s digimart=%s guitarguitar=%s ishibashi=%s sweelee=%s) has_more=%s",
+        pg,
         q_clean,
-        page_no,
         len(results),
         n_rev,
         n_dig,
@@ -2009,12 +1976,95 @@ async def api_search(
         has_more,
     )
 
-    return {
+    return results, has_more
+
+
+@app.get("/api/search")
+async def api_search(
+    q: str = Query(
+        "",
+        description=(
+            "搜索关键词；按 ``platforms`` 仅并发抓取勾选的平台（见该参数说明）"
+        ),
+    ),
+    page: int = Query(1, ge=1, description="页码，从 1 开始；五方使用同一页码参数"),
+    platforms: str = Query(
+        "all",
+        description='平台列表：``all`` 为五站全开；否则逗号分隔 slug，如 ``reverb,digimart``',
+    ),
+    condition: str = Query(
+        "all",
+        description='成色：``all`` | ``new``（仅全新）| ``used``（仅二手），在合并去重后过滤',
+    ),
+) -> dict[str, Any]:
+    """
+    按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
+
+    Digimart：``condition=new|used`` 时先在请求上加 ``productTypes``（新品/中古），再解析列表；
+    合并后仍按 ``condition`` 做一次全局成色过滤。
+
+    合并结果按规范化 ``url`` 去重（仅本次响应内）后，再按 ``condition`` 做二次过滤。
+
+    当 ``page>1`` 且过滤后结果为空时，自动向后最多尝试 ``API_SEARCH_EMPTY_PAGE_MAX_SKIP`` 页，
+    返回首个非空页；此时响应含 ``requested_page`` 与 ``page_adjusted``。
+
+    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
+    ``url`` / ``condition``（``全新`` 或 ``二手``）。
+    """
+    q_clean = q.strip()
+    if not q_clean:
+        return {"query": "", "page": 1, "has_more": False, "results": []}
+
+    page_no = max(1, page)
+    selected = parse_platforms_param(platforms)
+    raw_plat = (platforms or "").strip()
+    if raw_plat and raw_plat.lower() != "all" and not selected:
+        raise HTTPException(
+            status_code=400,
+            detail="请至少选择一个有效的搜索平台（reverb,digimart,guitarguitar,ishibashi,sweelee）",
+        )
+    cond_norm = normalize_condition_param(condition)
+
+    logger.info(
+        "[api/search] start query=%r page=%s platforms=%s condition=%s",
+        q_clean,
+        page_no,
+        sorted(selected),
+        cond_norm,
+    )
+
+    results, has_more = await _run_search_single_page(
+        q_clean, page_no, selected, cond_norm
+    )
+    effective_page = page_no
+    page_adjusted = False
+
+    if page_no > 1 and len(results) == 0:
+        for step in range(1, API_SEARCH_EMPTY_PAGE_MAX_SKIP + 1):
+            fp = page_no + step
+            results, has_more = await _run_search_single_page(
+                q_clean, fp, selected, cond_norm
+            )
+            if len(results) > 0:
+                effective_page = fp
+                page_adjusted = True
+                logger.info(
+                    "[api/search] empty-page forward: requested=%s effective=%s",
+                    page_no,
+                    fp,
+                )
+                break
+
+    payload: dict[str, Any] = {
         "query": q_clean,
-        "page": page_no,
+        "page": effective_page,
         "has_more": has_more,
         "results": results,
     }
+    if page_adjusted:
+        payload["requested_page"] = page_no
+        payload["page_adjusted"] = True
+    return payload
 
 
 if HAS_FRONTEND:
