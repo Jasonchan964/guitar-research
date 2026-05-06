@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { ChevronLeft, ChevronRight, Search } from 'lucide-react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react'
 import type { UnifiedListing, UnifiedSearchApiResponse } from './mockGuitars'
 
 const PLACEHOLDER_IMG =
@@ -90,7 +90,7 @@ function UnifiedPriceDisplay({ priceUsd, priceCny, currency }: UnifiedPriceProps
   return (
     <span className="relative inline-grid min-h-[1.35em] place-items-start">
       <span
-        className={`col-start-1 row-start-1 font-semibold tabular-nums tracking-tight text-emerald-700 transition-[opacity,transform] duration-200 ease-out dark:text-emerald-400 ${
+        className={`col-start-1 row-start-1 font-bold tabular-nums tracking-tight text-[#a91b16] transition-[opacity,transform] duration-200 ease-out dark:text-red-400 ${
           showUsd ? 'opacity-100' : 'pointer-events-none opacity-0 [transform:translateY(2px)]'
         }`}
         aria-hidden={!showUsd}
@@ -98,7 +98,7 @@ function UnifiedPriceDisplay({ priceUsd, priceCny, currency }: UnifiedPriceProps
         {usdLine}
       </span>
       <span
-        className={`col-start-1 row-start-1 font-semibold tabular-nums tracking-tight text-emerald-700 transition-[opacity,transform] duration-200 ease-out dark:text-emerald-400 ${
+        className={`col-start-1 row-start-1 font-bold tabular-nums tracking-tight text-[#a91b16] transition-[opacity,transform] duration-200 ease-out dark:text-red-400 ${
           showCny ? 'opacity-100' : 'pointer-events-none opacity-0 [transform:translateY(-2px)]'
         }`}
         aria-hidden={!showCny}
@@ -118,6 +118,134 @@ type SearchClusterProps = {
 }
 
 /** 当前页 ±2；无更多页时右侧不延伸 */
+type SortOrder = 'default' | 'price_asc' | 'price_desc'
+
+const SORT_LABELS: Record<SortOrder, string> = {
+  default: '默认排序',
+  price_asc: '价格：从低到高',
+  price_desc: '价格：从高到低',
+}
+
+type SortOrderMenuProps = {
+  value: SortOrder
+  onChange: (order: SortOrder) => void
+  disabled?: boolean
+}
+
+/** Google 搜索工具风格：无边框灰字按钮 + 浮层菜单 */
+function SortOrderMenu({ value, onChange, disabled }: SortOrderMenuProps) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const listboxId = useId()
+
+  useEffect(() => {
+    if (!open) return
+    const close = (e: PointerEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', close, true)
+    return () => document.removeEventListener('pointerdown', close, true)
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
+
+  useEffect(() => {
+    if (disabled) setOpen(false)
+  }, [disabled])
+
+  const options = (Object.keys(SORT_LABELS) as SortOrder[]).map((key) => ({
+    key,
+    label: SORT_LABELS[key],
+  }))
+
+  return (
+    <div ref={rootRef} className="relative flex justify-center">
+      <button
+        type="button"
+        disabled={disabled}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-controls={listboxId}
+        onClick={() => {
+          if (!disabled) setOpen((o) => !o)
+        }}
+        className="inline-flex items-center gap-0.5 rounded-md px-2 py-1.5 text-sm font-normal text-slate-600 transition-colors hover:bg-slate-100/90 disabled:cursor-not-allowed disabled:opacity-40 dark:text-slate-400 dark:hover:bg-slate-800/80"
+      >
+        <span className="select-none">{SORT_LABELS[value]}</span>
+        <ChevronDown
+          className={`h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 dark:text-slate-500 ${open ? 'rotate-180' : ''}`}
+          strokeWidth={2}
+          aria-hidden
+        />
+      </button>
+
+      {open && (
+        <ul
+          id={listboxId}
+          role="listbox"
+          aria-label="排序方式"
+          className="absolute left-1/2 top-full z-50 mt-1.5 min-w-[13.5rem] -translate-x-1/2 overflow-hidden rounded-xl border border-slate-200/90 bg-white py-1 shadow-lg shadow-slate-200/50 ring-1 ring-black/[0.04] dark:border-slate-700 dark:bg-slate-900 dark:shadow-black/40 dark:ring-white/[0.06]"
+        >
+          {options.map(({ key, label }) => {
+            const selected = value === key
+            return (
+              <li key={key} role="presentation">
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                    selected
+                      ? 'bg-slate-50 font-medium text-slate-900 dark:bg-slate-800/80 dark:text-slate-100'
+                      : 'text-slate-700 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800/50'
+                  }`}
+                  onClick={() => {
+                    onChange(key)
+                    setOpen(false)
+                  }}
+                >
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                    {selected ? (
+                      <Check className="h-3.5 w-3.5 text-slate-600 dark:text-slate-300" strokeWidth={2.5} />
+                    ) : null}
+                  </span>
+                  <span className="min-w-0 flex-1">{label}</span>
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+function sortListingsByOrder(items: UnifiedListing[], order: SortOrder): UnifiedListing[] {
+  if (order === 'default') return items
+  const copy = [...items]
+  copy.sort((a, b) => {
+    const pa = a.price_cny
+    const pb = b.price_cny
+    const na = pa == null
+    const nb = pb == null
+    if (na && nb) return 0
+    if (na) return 1
+    if (nb) return -1
+    if (order === 'price_asc') return pa - pb
+    return pb - pa
+  })
+  return copy
+}
+
 function buildPageRange(current: number, hasMore: boolean): number[] {
   const spread = 2
   const start = Math.max(1, current - spread)
@@ -254,8 +382,14 @@ function App() {
   const [currentPage, setCurrentPage] = useState(1)
   const [hasMore, setHasMore] = useState(false)
   const [listings, setListings] = useState<UnifiedListing[]>([])
+  const [sortOrder, setSortOrder] = useState<SortOrder>('default')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const displayedListings = useMemo(
+    () => sortListingsByOrder(listings, sortOrder),
+    [listings, sortOrder],
+  )
 
   const [currency, setCurrency] = useState<'USD' | 'CNY'>('USD')
   const [exchangeRate, setExchangeRate] = useState<number | null>(null)
@@ -328,6 +462,7 @@ function App() {
     if (!trimmed) return
     setSubmittedQuery(trimmed)
     setCurrentPage(1)
+    setSortOrder('default')
     void fetchSearchPage(trimmed, 1)
   }
 
@@ -425,9 +560,18 @@ function App() {
             </p>
           )}
           {!error && (
-            <p className="mb-10 text-center text-xs text-slate-400 dark:text-slate-500">
+            <p className="mb-6 text-center text-xs text-slate-400 dark:text-slate-500">
               标价由后端换算（Frankfurter）；切换 USD/CNY 仅改变展示币种。
             </p>
+          )}
+
+          {listings.length > 0 && (
+            <div className="mx-auto mb-8 flex flex-col items-center gap-1">
+              <span className="text-[11px] font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                排序
+              </span>
+              <SortOrderMenu value={sortOrder} onChange={setSortOrder} disabled={loading} />
+            </div>
           )}
 
           {!loading && !error && listings.length === 0 && (
@@ -440,7 +584,7 @@ function App() {
           {listings.length > 0 && (
             <section className="mt-4" aria-label="搜索结果">
               <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
-                {listings.map((item, index) => (
+                {displayedListings.map((item, index) => (
                   <li key={item.url ? `${item.url}-${index}` : `row-${index}`} className="min-w-0">
                     <article className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200/90 bg-white shadow-sm transition-shadow duration-200 hover:shadow-md md:rounded-2xl dark:border-slate-700/90 dark:bg-slate-900">
                       <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
@@ -457,14 +601,23 @@ function App() {
                         <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
                           {item.title}
                         </h2>
-                        <p className="shrink-0">
+                        <p className="flex shrink-0 flex-wrap items-center gap-1.5">
                           <span className="inline-flex rounded-full border border-slate-200/80 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600 sm:px-2.5 sm:text-xs dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300">
                             {item.source}
+                          </span>
+                          <span
+                            className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${
+                              item.condition === '全新'
+                                ? 'border-emerald-200/90 bg-emerald-50 text-emerald-700 dark:border-emerald-800/60 dark:bg-emerald-950/45 dark:text-emerald-400'
+                                : 'border-slate-200/90 bg-slate-100 text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                            }`}
+                          >
+                            {item.condition === '全新' ? '全新' : '二手'}
                           </span>
                         </p>
                         <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
                           <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
-                          <span className="min-w-0 max-w-full sm:whitespace-nowrap">
+                          <span className="min-w-0 max-w-full whitespace-nowrap text-sm font-bold sm:text-base">
                             <UnifiedPriceDisplay
                               priceUsd={item.price_usd}
                               priceCny={item.price_cny}

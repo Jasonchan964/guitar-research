@@ -6,7 +6,7 @@
 
 另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
 `GET /api/search` 并发请求 Reverb 与 Digimart；Digimart 失败不影响 Reverb。
-返回统一结构：title / image / price_usd / price_cny / source / url（汇率来自 Frankfurter）。
+返回统一结构：title / image / price_usd / price_cny / source / url / condition（汇率来自 Frankfurter）。
 """
 
 from __future__ import annotations
@@ -150,8 +150,42 @@ def _parse_jpy_amount(text: str) -> int | None:
     return n if n > 0 else None
 
 
+def _digimart_condition_from_block(block: Any) -> str:
+    """
+    从 Digimart 列表卡片上解析成色标签文案。
+    优先扫描常见标签区域，避免标题里单独的「新」字误判（尽力而为）。
+    """
+    chunks: list[str] = []
+    for sel in (
+        ".itemState",
+        ".itemTags",
+        ".itemTag",
+        ".itemLabel",
+        ".labels",
+        "[class*='Tag']",
+        "[class*='tag']",
+        "[class*='Label']",
+        "[class*='label']",
+        "[class*='State']",
+        "[class*='state']",
+        "[class*='badge']",
+        "[class*='Badge']",
+    ):
+        for el in block.select(sel):
+            t = el.get_text(" ", strip=True)
+            if t:
+                chunks.append(t)
+    blob = " ".join(chunks) if chunks else block.get_text(" ", strip=True)
+    blob_lower = blob.lower()
+    if "中古" in blob or "used" in blob_lower:
+        return "二手"
+    if "新" in blob:
+        return "全新"
+    return "二手"
+
+
 def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
-    """单条 Digimart ``.itemSearchListItem`` → 标题、图片、日元整数、链接。"""
+    """单条 Digimart ``.itemSearchListItem`` → 标题、图片、日元整数、链接、成色。"""
     ttl = block.select_one("p.ttl a")
     if ttl is None:
         return None
@@ -176,7 +210,27 @@ def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
     if jpy is None:
         return None
 
-    return {"title": title, "image": image, "jpy": jpy, "url": url}
+    condition = _digimart_condition_from_block(block)
+    return {"title": title, "image": image, "jpy": jpy, "url": url, "condition": condition}
+
+
+def _reverb_condition_cn(listing: dict[str, Any]) -> str:
+    """Reverb listing 的 ``condition`` → 统一中文「全新」/「二手」。"""
+    raw: Any = listing.get("condition")
+    if isinstance(raw, dict):
+        raw = (
+            raw.get("display_name")
+            or raw.get("name")
+            or raw.get("display")
+            or raw.get("slug")
+            or raw.get("uuid")
+        )
+    if raw is None:
+        return "二手"
+    normalized = str(raw).strip().casefold().replace("_", " ")
+    if normalized == "brand new":
+        return "全新"
+    return "二手"
 
 
 async def scrape_digimart(keyword: str, page: int = 1) -> list[dict[str, Any]]:
@@ -300,6 +354,7 @@ def _unified_row(
     source: str,
     price_cny: float | None,
     usd_to_cny: float,
+    condition: str,
 ) -> dict[str, Any]:
     price_usd: float | None = None
     if price_cny is not None and usd_to_cny > 0:
@@ -311,6 +366,7 @@ def _unified_row(
         "price_cny": round(price_cny, 2) if price_cny is not None else None,
         "source": source,
         "url": url,
+        "condition": condition,
     }
 
 
@@ -376,7 +432,7 @@ async def api_search(
     ``asyncio.gather`` 并发：Reverb（需 ``REVERB_TOKEN``）与 ``scrape_digimart``。
     Digimart 异常已吞掉；Reverb 仍按原 API 报错规则抛出。
 
-    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` / ``url``。
+    每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` / ``url`` / ``condition``（``全新`` 或 ``二手``）。
     响应含 ``page``、``has_more``（任一侧满页则视为可能还有下一页）。
     汇价：Frankfurter（``amount * (1 单位外币→CNY)``）；``price_usd`` = ``price_cny / (1 USD→CNY)``。
     """
@@ -473,6 +529,7 @@ async def api_search(
                 source="Reverb",
                 price_cny=price_cny,
                 usd_to_cny=usd_to_cny,
+                condition=_reverb_condition_cn(listing),
             )
         )
 
@@ -481,6 +538,9 @@ async def api_search(
         pcny: float | None = None
         if "JPY" in rates_map:
             pcny = jpy_amt * rates_map["JPY"]
+        digi_condition = str(d.get("condition") or "二手")
+        if digi_condition not in ("全新", "二手"):
+            digi_condition = "二手"
         results.append(
             _unified_row(
                 title=str(d["title"]),
@@ -489,6 +549,7 @@ async def api_search(
                 source="Digimart",
                 price_cny=pcny,
                 usd_to_cny=usd_to_cny,
+                condition=digi_condition,
             )
         )
 

@@ -6,6 +6,8 @@ export type UnifiedListing = {
   price_cny: number | null
   source: string
   url: string
+  /** 后端统一：`全新` 或 `二手` */
+  condition: string
 }
 
 export type UnifiedSearchApiResponse = {
