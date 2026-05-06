@@ -1,20 +1,12 @@
 import { useEffect, useState } from 'react'
 import { Search } from 'lucide-react'
-import type { ReverbListing, ReverbSearchApiResponse } from './mockGuitars'
+import type { UnifiedListing, UnifiedSearchApiResponse } from './mockGuitars'
 
 const PLACEHOLDER_IMG =
   'data:image/svg+xml,' +
   encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect fill="#f1f5f9" width="640" height="480"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="system-ui" font-size="18">No image</text></svg>',
   )
-
-/** 解析 Reverb `1234.56 USD` */
-function parseUsdAmount(raw: string): number | null {
-  const m = raw.trim().match(/^([\d,.]+)\s+USD$/i)
-  if (!m) return null
-  const n = parseFloat(m[1].replace(/,/g, ''))
-  return Number.isNaN(n) ? null : n
-}
 
 function formatUsdPretty(amount: number): string {
   return `$${amount.toLocaleString('en-US', {
@@ -23,9 +15,8 @@ function formatUsdPretty(amount: number): string {
   })}`
 }
 
-function formatCnyPretty(amountUsd: number, rate: number): string {
-  const cny = amountUsd * rate
-  return `¥${cny.toLocaleString('zh-CN', {
+function formatCnyFromServer(amount: number): string {
+  return `¥${amount.toLocaleString('zh-CN', {
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
   })}`
@@ -83,23 +74,18 @@ function CurrencyToggle({ currency, onChange, compact }: CurrencyToggleProps) {
   )
 }
 
-type PriceCrossfadeProps = {
-  rawPrice: string
+type UnifiedPriceProps = {
+  priceUsd: number | null
+  priceCny: number | null
   currency: 'USD' | 'CNY'
-  rate: number | null
-  rateReady: boolean
 }
 
-function PriceCrossfade({ rawPrice, currency, rate, rateReady }: PriceCrossfadeProps) {
-  const amount = parseUsdAmount(rawPrice)
-  const isUsdLike = amount != null
-
-  const usdLine = isUsdLike ? formatUsdPretty(amount) : rawPrice
-  const cnyLine =
-    isUsdLike && rate != null ? formatCnyPretty(amount, rate) : null
-
-  const showCny = currency === 'CNY' && isUsdLike && rateReady && cnyLine != null
-  const showUsd = currency === 'USD' || !isUsdLike || !rateReady || cnyLine == null
+/** 使用后端已换算的 ``price_usd`` / ``price_cny`` 切换展示 */
+function UnifiedPriceDisplay({ priceUsd, priceCny, currency }: UnifiedPriceProps) {
+  const usdLine = priceUsd != null ? formatUsdPretty(priceUsd) : '—'
+  const cnyLine = priceCny != null ? formatCnyFromServer(priceCny) : '—'
+  const showCny = currency === 'CNY'
+  const showUsd = currency === 'USD'
 
   return (
     <span className="relative inline-grid min-h-[1.35em] place-items-start">
@@ -117,7 +103,7 @@ function PriceCrossfade({ rawPrice, currency, rate, rateReady }: PriceCrossfadeP
         }`}
         aria-hidden={!showCny}
       >
-        {cnyLine ?? usdLine}
+        {cnyLine}
       </span>
     </span>
   )
@@ -196,7 +182,7 @@ function SearchCluster({
 function App() {
   const [query, setQuery] = useState('')
   const [submittedQuery, setSubmittedQuery] = useState<string | null>(null)
-  const [listings, setListings] = useState<ReverbListing[]>([])
+  const [listings, setListings] = useState<UnifiedListing[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -242,12 +228,12 @@ function App() {
     setError(null)
 
     try {
-      const res = await fetch(`/search?q=${encodeURIComponent(trimmed)}`)
+      const res = await fetch(`/api/search?q=${encodeURIComponent(trimmed)}`)
       if (!res.ok) {
         const text = await res.text()
         throw new Error(text || `请求失败 (${res.status})`)
       }
-      const data: ReverbSearchApiResponse = await res.json()
+      const data: UnifiedSearchApiResponse = await res.json()
       setListings(data.results)
     } catch (e) {
       setListings([])
@@ -334,7 +320,7 @@ function App() {
         <main className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
           {submittedQuery && (
             <p className="mb-2 text-center text-sm text-slate-500 dark:text-slate-400">
-              Reverb 搜索结果 · 「{submittedQuery}」
+              Reverb + Digimart 搜索结果 · 「{submittedQuery}」
               {loading && ' · 加载中…'}
             </p>
           )}
@@ -345,7 +331,7 @@ function App() {
           )}
           {!error && (
             <p className="mb-10 text-center text-xs text-slate-400 dark:text-slate-500">
-              USD / CNY 仅对「金额 + USD」标价换算；其它币种显示原价。
+              标价由后端换算（Frankfurter）；切换 USD/CNY 仅改变展示币种。
             </p>
           )}
 
@@ -364,7 +350,7 @@ function App() {
                     <article className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200/90 bg-white shadow-sm transition-shadow duration-200 hover:shadow-md md:rounded-2xl dark:border-slate-700/90 dark:bg-slate-900">
                       <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
                         <img
-                          src={item.imageUrl || PLACEHOLDER_IMG}
+                          src={item.image || PLACEHOLDER_IMG}
                           alt=""
                           className="h-full w-full object-cover object-center"
                           loading="lazy"
@@ -378,17 +364,16 @@ function App() {
                         </h2>
                         <p className="shrink-0">
                           <span className="inline-flex rounded-full border border-slate-200/80 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600 sm:px-2.5 sm:text-xs dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                            Reverb
+                            {item.source}
                           </span>
                         </p>
                         <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
                           <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
                           <span className="min-w-0 max-w-full sm:whitespace-nowrap">
-                            <PriceCrossfade
-                              rawPrice={item.price}
+                            <UnifiedPriceDisplay
+                              priceUsd={item.price_usd}
+                              priceCny={item.price_cny}
                               currency={currency}
-                              rate={exchangeRate}
-                              rateReady={rateReady}
                             />
                           </span>
                         </p>

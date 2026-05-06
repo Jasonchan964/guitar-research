@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,13 @@ from env_load import load_project_dotenv
 load_project_dotenv()
 
 from exchange_rate_cache import get_usd_cny_rate_cached
+
+if not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+logger = logging.getLogger(__name__)
 from reverb_client import (
     extract_first_photo_url,
     extract_listing_web_url,
@@ -174,7 +183,10 @@ async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
     """
     q = keyword.strip()
     if not q:
+        logger.info("[Digimart] scrape skipped (empty keyword)")
         return []
+
+    logger.info("[Digimart] scrape start keyword=%r", q)
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(
@@ -184,14 +196,57 @@ async def scrape_digimart(keyword: str) -> list[dict[str, Any]]:
             )
             r.raise_for_status()
 
+        logger.info(
+            "[Digimart] http ok status=%s response_bytes=%s",
+            r.status_code,
+            len(r.text or ""),
+        )
+
         soup = BeautifulSoup(r.text, "html.parser")
         out: list[dict[str, Any]] = []
         for block in soup.select(".itemSearchListItem"):
             item = _digimart_block_to_raw(block)
             if item is not None:
                 out.append(item)
+
+        logger.info("[Digimart] scrape success keyword=%r parsed_items=%s", q, len(out))
+        if not out and len(r.text or "") > 500:
+            logger.warning(
+                "[Digimart] zero parsed items but large HTML (%s bytes) — "
+                "likely layout/selector mismatch or blocking page",
+                len(r.text),
+            )
         return out
-    except Exception:
+    except Exception as e:
+        line = (
+            f"[Digimart] scrape_digimart error | keyword={q!r} | "
+            f"type={type(e).__name__} | details={str(e)}"
+        )
+        print(line, flush=True)
+        logger.error(line, exc_info=True)
+        if isinstance(e, httpx.HTTPStatusError):
+            resp = e.response
+            if resp is not None:
+                snippet = (resp.text or "")[:500].replace("\n", " ")
+                detail = (
+                    f"[Digimart] HTTPStatusError status_code={resp.status_code} "
+                    f"url={resp.url} body_snippet={snippet!r}"
+                )
+                print(detail, flush=True)
+                logger.error(detail)
+        elif isinstance(e, httpx.TimeoutException):
+            detail = (
+                f"[Digimart] Timeout {type(e).__name__}: "
+                "Connect/Read/Write/Pool — 可调大 timeout 或检查出站网络"
+            )
+            print(detail, flush=True)
+            logger.error(detail)
+        elif isinstance(e, httpx.RequestError):
+            detail = f"[Digimart] RequestError (连接/TLS/DNS 等): {e!r}"
+            print(detail, flush=True)
+            logger.error(detail)
+        tb = traceback.format_exc()
+        print(f"[Digimart] full traceback:\n{tb}", flush=True)
         return []
 
 
@@ -268,7 +323,7 @@ async def search_reverb(
     """
     调用 Reverb ``/api/listings/all``，返回标题、图片、价格、原页链接。
 
-    前端：搜索框旁的「搜索」按钮与回车均发起 ``GET /search?q=...``。
+    前端默认使用 ``GET /api/search``（含 Digimart）；本路由保留给仅需 Reverb 的调用方。
 
     需在 ``backend/.env`` 中配置 ``REVERB_TOKEN``（Personal Access Token）。
     """
@@ -309,13 +364,25 @@ async def api_search(
     if not q_clean:
         return {"query": "", "results": []}
 
+    logger.info("[api/search] start concurrent Reverb+Digimart query=%r", q_clean)
+
     rev_out, digi_out = await asyncio.gather(
         _fetch_reverb_listings(q_clean),
         scrape_digimart(q_clean),
         return_exceptions=True,
     )
 
-    digi_raw: list[dict[str, Any]] = [] if isinstance(digi_out, Exception) else digi_out
+    if not isinstance(digi_out, list):
+        logger.error(
+            "[api/search] Digimart task returned non-list (unexpected): %r",
+            digi_out,
+            exc_info=(
+                (type(digi_out), digi_out, digi_out.__traceback__)
+                if isinstance(digi_out, BaseException)
+                else None
+            ),
+        )
+    digi_raw: list[dict[str, Any]] = digi_out if isinstance(digi_out, list) else []
 
     if isinstance(rev_out, Exception):
         if isinstance(rev_out, httpx.HTTPStatusError):
@@ -397,6 +464,16 @@ async def api_search(
                 usd_to_cny=usd_to_cny,
             )
         )
+
+    n_rev = sum(1 for row in results if row.get("source") == "Reverb")
+    n_dig = sum(1 for row in results if row.get("source") == "Digimart")
+    logger.info(
+        "[api/search] done query=%r total=%s (reverb=%s digimart=%s)",
+        q_clean,
+        len(results),
+        n_rev,
+        n_dig,
+    )
 
     return {"query": q_clean, "results": results}
 
