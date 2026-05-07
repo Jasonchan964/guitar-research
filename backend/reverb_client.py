@@ -192,6 +192,7 @@ def _reverb_listings_query_params(
     page: int,
     per_page: int,
     condition: str = "all",
+    sort: str = "relevance",
 ) -> list[tuple[str, str | int]]:
     """
     Reverb ``GET /api/listings`` 查询串（键名必须与官方一致）：
@@ -199,6 +200,7 @@ def _reverb_listings_query_params(
     - ``query``：搜索词（**不得**使用 ``q``）
     - ``page``：页码（从 1 起）
     - ``per_page``：每页条数（默认 24）
+    - ``order``：排序（``relevance`` | ``price_desc`` | ``price_asc``，与 Reverb 列表搜索一致）
     - ``conditions[]``：仅当 ``condition`` 为 ``new`` / ``used`` 时追加；``all`` 不带任何 conditions
 
     使用 ``list[tuple]`` 以便稳定生成 ``conditions[]=…`` 数组形式。
@@ -210,6 +212,10 @@ def _reverb_listings_query_params(
         ("page", max(1, int(page))),
         ("per_page", int(per_page)),
     ]
+    s = (sort or "relevance").strip().lower()
+    if s not in ("relevance", "price_desc", "price_asc"):
+        s = "relevance"
+    pairs.append(("order", s))
     if cond == "new":
         pairs.append(("conditions[]", "new"))
     elif cond == "used":
@@ -224,6 +230,7 @@ def search_reverb_listings_sync(
     page: int = 1,
     per_page: int = REVERB_LISTINGS_PER_PAGE_DEFAULT,
     condition: str = "all",
+    sort: str = "relevance",
     request_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -233,7 +240,7 @@ def search_reverb_listings_sync(
         request_headers if request_headers is not None else reverb_request_headers(access_token)
     )
     params = _reverb_listings_query_params(
-        query, page=page, per_page=per_page, condition=condition
+        query, page=page, per_page=per_page, condition=condition, sort=sort
     )
 
     try:
@@ -274,6 +281,7 @@ async def search_reverb_listings_async(
     page: int = 1,
     per_page: int = REVERB_LISTINGS_PER_PAGE_DEFAULT,
     condition: str = "all",
+    sort: str = "relevance",
     request_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """异步版本，供 FastAPI 路由使用。``request_headers`` 若传入则优先（须含 Bearer / Accept v2）。"""
@@ -281,7 +289,7 @@ async def search_reverb_listings_async(
         request_headers if request_headers is not None else reverb_request_headers(access_token)
     )
     params = _reverb_listings_query_params(
-        query, page=page, per_page=per_page, condition=condition
+        query, page=page, per_page=per_page, condition=condition, sort=sort
     )
 
     try:

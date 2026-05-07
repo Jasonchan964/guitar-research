@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 与 ``scrape_reverb`` 使用 Reverb API，仅读取环境变量 ``REVERB_API_TOKEN``。
-`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
+`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），支持 ``sort``（``relevance`` / ``price_desc`` / ``price_asc``）；合并多站时在服务端全局排序与分页，并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
 
@@ -83,6 +83,10 @@ DIGIMART_PRODUCT_TYPE_NEW = "NEW"
 DIGIMART_PRODUCT_TYPE_USED = "USED"
 # Reverb ``per_page``（与 ``reverb_client.REVERB_LISTINGS_PER_PAGE_DEFAULT`` 一致）与列表「满页」启发式
 REVERB_PER_PAGE = REVERB_LISTINGS_PER_PAGE_DEFAULT
+# ``/api/search`` 返回给前端的统一分页长度（多站合并后按该宽度切片）
+SEARCH_PAGE_SIZE = REVERB_PER_PAGE
+# 多平台合并时最多向后抓取的平台页数（每轮每站一页），用于凑齐「全局排序」下的第 N 页窗口
+SEARCH_MERGE_MAX_ROUNDS = 15
 # Digimart 搜索页常见每页 20 条
 DIGIMART_PER_PAGE = 20
 # 常见桌面 Chrome UA，降低被站点拒绝的概率（仍需遵守对方 robots/条款）
@@ -667,6 +671,7 @@ async def scrape_digimart(
     page: int = 1,
     *,
     condition: str = "all",
+    sort: str = "relevance",
 ) -> list[dict[str, Any]]:
     """
     异步抓取 Digimart 搜索页（与 ``test_digimart.py`` 同源解析逻辑）。
@@ -690,14 +695,24 @@ async def scrape_digimart(
 
     pg = max(1, int(page))
     cond = normalize_condition_param(condition)
+    sort_norm = normalize_sort_param(sort)
 
-    logger.info("[Digimart] scrape start keyword=%r page=%s condition=%s", q, pg, cond)
+    logger.info(
+        "[Digimart] scrape start keyword=%r page=%s condition=%s sort=%s",
+        q,
+        pg,
+        cond,
+        sort_norm,
+    )
     try:
         params: dict[str, Any] = {"keyword": q, "currentPage": pg}
         if cond == "new":
             params["productTypes"] = DIGIMART_PRODUCT_TYPE_NEW
         elif cond == "used":
             params["productTypes"] = DIGIMART_PRODUCT_TYPE_USED
+        sk = _digimart_sort_key_param(sort_norm)
+        if sk:
+            params["sortKey"] = sk
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             r = await client.get(
                 DIGIMART_SEARCH,
@@ -1633,6 +1648,7 @@ async def scrape_reverb(
     page: int = 1,
     *,
     condition: str = "all",
+    sort: str = "relevance",
 ) -> list[dict[str, Any]]:
     """
     通过 Reverb 官方 API（Bearer PAT）拉取列表；失败原因见 ``reverb_client`` 内终端调试输出。
@@ -1662,7 +1678,14 @@ async def scrape_reverb(
 
     pg = max(1, int(page))
     cond = normalize_condition_param(condition)
-    logger.info("[Reverb] scrape_reverb start keyword=%r page=%s condition=%s", q, pg, cond)
+    sort_norm = normalize_sort_param(sort)
+    logger.info(
+        "[Reverb] scrape_reverb start keyword=%r page=%s condition=%s sort=%s",
+        q,
+        pg,
+        cond,
+        sort_norm,
+    )
 
     try:
         return await search_reverb_listings_async(
@@ -1671,6 +1694,7 @@ async def scrape_reverb(
             page=pg,
             per_page=REVERB_PER_PAGE,
             condition=cond,
+            sort=sort_norm,
             request_headers=headers,
         )
     except Exception as e:
@@ -1684,9 +1708,10 @@ async def _fetch_reverb_listings(
     page: int = 1,
     *,
     condition: str = "all",
+    sort: str = "relevance",
 ) -> list[dict[str, Any]]:
     """内部封装：与 ``scrape_reverb`` 同源，供合并搜索复用。"""
-    return await scrape_reverb(query, page, condition=condition)
+    return await scrape_reverb(query, page, condition=condition, sort=sort)
 
 
 async def _safe_fetch_reverb_listings_for_merge(
@@ -1694,6 +1719,7 @@ async def _safe_fetch_reverb_listings_for_merge(
     page: int = 1,
     *,
     condition: str = "all",
+    sort: str = "relevance",
 ) -> list[dict[str, Any]]:
     """供 ``/api/search`` 合并结果使用：Reverb 异常时返回空列表，不阻断其他平台。"""
     q = query.strip()
@@ -1701,7 +1727,7 @@ async def _safe_fetch_reverb_listings_for_merge(
         return []
     pg = max(1, int(page))
     try:
-        return await _fetch_reverb_listings(q, pg, condition=condition)
+        return await _fetch_reverb_listings(q, pg, condition=condition, sort=sort)
     except Exception as e:
         line = (
             f"[Reverb] merge fetch failed | query={q!r} page={pg} | "
@@ -1820,6 +1846,86 @@ def normalize_condition_param(raw: str) -> str:
     return "all"
 
 
+def normalize_sort_param(raw: str | None) -> str:
+    """
+    统一排序：``relevance``（默认）| ``price_desc`` | ``price_asc``。
+    接受 ``default`` 作为 ``relevance`` 的别名（与前端历史排序选项对齐）。
+    """
+    s = (raw or "relevance").strip().lower()
+    if s == "default":
+        return "relevance"
+    if s in ("relevance", "price_desc", "price_asc"):
+        return s
+    return "relevance"
+
+
+def _digimart_sort_key_param(sort_norm: str) -> str | None:
+    """Digimart ``sortKey``：新品排序走站点默认（不传）；价格类显式传 ``PRICE_*``。"""
+    if sort_norm == "price_desc":
+        return "PRICE_DESC"
+    if sort_norm == "price_asc":
+        return "PRICE_ASC"
+    return None
+
+
+def _keyword_title_match_score(title: str, query: str) -> float:
+    """关键词在标题中的出现频率加权（相关度回退，及多站合并时的全局相关度）。"""
+    q = (query or "").strip()
+    if not q:
+        return 0.0
+    tl = title.lower()
+    ql = q.lower()
+    score = float(tl.count(ql)) * 3.0
+    for tok in re.split(r"[\s　]+", q):
+        t = tok.strip().lower()
+        if len(t) < 2:
+            continue
+        score += float(tl.count(t))
+    return score
+
+
+def _price_sort_tuple_desc(row: dict[str, Any]) -> tuple[int, float]:
+    """价格降序键：无价格排最后。"""
+    p = row.get("price_cny")
+    if p is None:
+        return (1, 0.0)
+    try:
+        return (0, -float(p))
+    except (TypeError, ValueError):
+        return (1, 0.0)
+
+
+def _price_sort_tuple_asc(row: dict[str, Any]) -> tuple[int, float]:
+    """价格升序键：无价格排最后。"""
+    p = row.get("price_cny")
+    if p is None:
+        return (1, 0.0)
+    try:
+        return (0, float(p))
+    except (TypeError, ValueError):
+        return (1, 0.0)
+
+
+def sort_unified_search_rows(
+    rows: list[dict[str, Any]],
+    sort_norm: str,
+    query: str,
+) -> list[dict[str, Any]]:
+    """合并后的全局排序（同一请求内去重后的列表）。"""
+    if sort_norm == "price_desc":
+        return sorted(rows, key=_price_sort_tuple_desc)
+    if sort_norm == "price_asc":
+        return sorted(rows, key=_price_sort_tuple_asc)
+    if sort_norm == "relevance":
+
+        def rel_key(r: dict[str, Any]) -> tuple[float, str]:
+            sc = _keyword_title_match_score(str(r.get("title") or ""), query)
+            return (-sc, str(r.get("title") or ""))
+
+        return sorted(rows, key=rel_key)
+    return rows
+
+
 def filter_results_by_condition(rows: list[dict[str, Any]], condition: str) -> list[dict[str, Any]]:
     """
     合并去重后的成色过滤：``new`` → 仅 ``全新``；``used`` → 仅 ``二手``；``all`` 不变。
@@ -1879,6 +1985,10 @@ async def search_reverb(
         min_length=1,
         description="搜索关键词，例如 Fender（前端搜索框输入后点「搜索」或按回车提交）",
     ),
+    sort: str = Query(
+        "relevance",
+        description="排序：``relevance`` | ``price_desc`` | ``price_asc``（传入 Reverb ``order``）",
+    ),
 ) -> dict[str, Any]:
     """
     调用 Reverb ``GET https://api.reverb.com/api/listings``，返回标题、图片、价格、原页链接。
@@ -1894,31 +2004,36 @@ async def search_reverb(
             detail="未配置 REVERB_API_TOKEN。请在 backend/.env 中设置 REVERB_API_TOKEN=你的令牌",
         )
 
+    sort_norm = normalize_sort_param(sort)
     raw = await search_reverb_listings_async(
         token,
         q.strip(),
         page=1,
         per_page=REVERB_PER_PAGE,
         condition="all",
+        sort=sort_norm,
         request_headers=_reverb_official_request_headers(token),
     )
 
     results = [listing_to_search_item(item) for item in raw]
-    return {"query": q.strip(), "results": results}
+    return {"query": q.strip(), "sort": sort_norm, "results": results}
 
 
 # 请求第 N 页结果为空时，向后最多再尝试的页数（N+1 … N+API_SEARCH_EMPTY_PAGE_MAX_SKIP）
 API_SEARCH_EMPTY_PAGE_MAX_SKIP = 2
 
 
-async def _run_search_single_page(
+async def _merge_search_single_round(
     q_clean: str,
     fetch_page: int,
     selected: set[str],
     cond_norm: str,
+    sort_norm: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """
-    抓取 ``fetch_page`` 对应的一屏：五路并发 → 合并 → **本次响应内** URL 去重 → 成色过滤。
+    抓取 ``fetch_page`` 对应的一轮（每站同一页码）：五路并发 → 合并 → **本轮内** URL 去重 → 成色过滤。
+    第三方接口在支持时携带排序参数（Reverb ``order``、Digimart ``sortKey``）。
+
     返回 ``(results, has_more)``；若所有平台原始列表均为空则 ``([], False)``。
     """
     pg = max(1, int(fetch_page))
@@ -1928,11 +2043,13 @@ async def _run_search_single_page(
 
     if "reverb" in selected:
         coros.append(
-            _safe_fetch_reverb_listings_for_merge(q_clean, pg, condition=cond_norm),
+            _safe_fetch_reverb_listings_for_merge(
+                q_clean, pg, condition=cond_norm, sort=sort_norm
+            ),
         )
         labels.append("reverb")
     if "digimart" in selected:
-        coros.append(scrape_digimart(q_clean, pg, condition=cond_norm))
+        coros.append(scrape_digimart(q_clean, pg, condition=cond_norm, sort=sort_norm))
         labels.append("digimart")
     if "guitarguitar" in selected:
         coros.append(scrape_guitarguitar(q_clean, pg))
@@ -2210,6 +2327,61 @@ async def _run_search_single_page(
     return results, has_more
 
 
+async def _run_global_search(
+    q_clean: str,
+    page_no: int,
+    selected: set[str],
+    cond_norm: str,
+    sort_norm: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    统一分页语义下的全局排序结果：
+
+    - **仅选一个平台**：直接使用该平台第 ``page_no`` 页（第三方已按 ``sort`` 排序）。
+    - **多平台**：轮询各平台第 ``1 … R`` 页，跨轮 URL 去重后整体排序，再取出全局第
+      ``(page_no-1)*SEARCH_PAGE_SIZE + 1 … page_no*SEARCH_PAGE_SIZE`` 条。
+    """
+    if len(selected) == 1:
+        rows, hm = await _merge_search_single_round(
+            q_clean, page_no, selected, cond_norm, sort_norm
+        )
+        # 仅 Reverb 时「相关度」已由接口 ``order=relevance`` 排序，不再用标题词频覆盖。
+        if sort_norm == "relevance" and selected == {"reverb"}:
+            return rows, hm
+        rows = sort_unified_search_rows(rows, sort_norm, q_clean)
+        return rows, hm
+
+    seen: set[str] = set()
+    acc: list[dict[str, Any]] = []
+    last_has_more = False
+    need = page_no * SEARCH_PAGE_SIZE
+    max_r = min(SEARCH_MERGE_MAX_ROUNDS, max(page_no + 8, 4))
+
+    for r in range(1, max_r + 1):
+        batch, hm = await _merge_search_single_round(
+            q_clean, r, selected, cond_norm, sort_norm
+        )
+        last_has_more = hm
+        for row in batch:
+            key = _normalize_url_for_dedup(str(row.get("url") or ""))
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            acc.append(row)
+        acc = sort_unified_search_rows(acc, sort_norm, q_clean)
+        if len(acc) >= need:
+            break
+        if not batch:
+            break
+
+    start = (page_no - 1) * SEARCH_PAGE_SIZE
+    end = start + SEARCH_PAGE_SIZE
+    window = acc[start:end]
+    has_more = len(acc) > end or last_has_more
+    return window, has_more
+
+
 @app.get("/api/search")
 async def api_search(
     q: str = Query(
@@ -2226,6 +2398,13 @@ async def api_search(
     condition: str = Query(
         "all",
         description='成色：``all`` | ``new``（仅全新）| ``used``（仅二手），在合并去重后过滤',
+    ),
+    sort: str = Query(
+        "relevance",
+        description=(
+            "排序：``relevance``（默认，相关度优先）| ``price_desc`` | ``price_asc``；"
+            "多站合并时在服务端做全局排序与分页"
+        ),
     ),
 ) -> dict[str, Any]:
     """
@@ -2245,8 +2424,15 @@ async def api_search(
     ``description``（商品详情 HTML，无则为空串）。
     """
     q_clean = q.strip()
+    sort_norm = normalize_sort_param(sort)
     if not q_clean:
-        return {"query": "", "page": 1, "has_more": False, "results": []}
+        return {
+            "query": "",
+            "page": 1,
+            "has_more": False,
+            "sort": sort_norm,
+            "results": [],
+        }
 
     page_no = max(1, page)
     selected = parse_platforms_param(platforms)
@@ -2259,15 +2445,16 @@ async def api_search(
     cond_norm = normalize_condition_param(condition)
 
     logger.info(
-        "[api/search] start query=%r page=%s platforms=%s condition=%s",
+        "[api/search] start query=%r page=%s platforms=%s condition=%s sort=%s",
         q_clean,
         page_no,
         sorted(selected),
         cond_norm,
+        sort_norm,
     )
 
-    results, has_more = await _run_search_single_page(
-        q_clean, page_no, selected, cond_norm
+    results, has_more = await _run_global_search(
+        q_clean, page_no, selected, cond_norm, sort_norm
     )
     effective_page = page_no
     page_adjusted = False
@@ -2275,8 +2462,8 @@ async def api_search(
     if page_no > 1 and len(results) == 0:
         for step in range(1, API_SEARCH_EMPTY_PAGE_MAX_SKIP + 1):
             fp = page_no + step
-            results, has_more = await _run_search_single_page(
-                q_clean, fp, selected, cond_norm
+            results, has_more = await _run_global_search(
+                q_clean, fp, selected, cond_norm, sort_norm
             )
             if len(results) > 0:
                 effective_page = fp
@@ -2292,6 +2479,7 @@ async def api_search(
         "query": q_clean,
         "page": effective_page,
         "has_more": has_more,
+        "sort": sort_norm,
         "results": results,
     }
     if page_adjusted:

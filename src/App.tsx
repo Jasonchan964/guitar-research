@@ -190,7 +190,7 @@ function FilterToolbar({
 type SortOrder = 'default' | 'price_asc' | 'price_desc'
 
 const SORT_LABELS: Record<SortOrder, string> = {
-  default: '默认排序',
+  default: '相关度优先',
   price_asc: '价格：从低到高',
   price_desc: '价格：从高到低',
 }
@@ -296,21 +296,10 @@ function SortOrderMenu({ value, onChange, disabled }: SortOrderMenuProps) {
   )
 }
 
-function sortListingsByOrder(items: UnifiedListing[], order: SortOrder): UnifiedListing[] {
-  if (order === 'default') return items
-  const copy = [...items]
-  copy.sort((a, b) => {
-    const pa = a.price_cny
-    const pb = b.price_cny
-    const na = pa == null
-    const nb = pb == null
-    if (na && nb) return 0
-    if (na) return 1
-    if (nb) return -1
-    if (order === 'price_asc') return pa - pb
-    return pb - pa
-  })
-  return copy
+/** 与后端 ``GET /api/search?sort=`` 对齐：默认对应 ``relevance`` */
+function mapSortOrderToApi(order: SortOrder): string {
+  if (order === 'default') return 'relevance'
+  return order
 }
 
 function buildPageRange(current: number, hasMore: boolean): number[] {
@@ -493,11 +482,6 @@ function SearchHome() {
   const [conditionFilter, setConditionFilter] = useState<ConditionFilter>('all')
   const [activeFilters, setActiveFilters] = useState<ActiveSearchFilters | null>(null)
 
-  const displayedListings = useMemo(
-    () => sortListingsByOrder(listings, sortOrder),
-    [listings, sortOrder],
-  )
-
   const [currency, setCurrency] = useState<'USD' | 'CNY'>('USD')
   const [exchangeRate, setExchangeRate] = useState<number | null>(null)
   const [rateLoading, setRateLoading] = useState(true)
@@ -538,6 +522,10 @@ function SearchHome() {
       setQuery(data.query)
       setCurrentPage(typeof data.page === 'number' && data.page >= 1 ? data.page : 1)
       setHasMore(Boolean(data.has_more))
+      if (typeof data.sort === 'string') {
+        if (data.sort === 'relevance') setSortOrder('default')
+        else if (data.sort === 'price_asc' || data.sort === 'price_desc') setSortOrder(data.sort)
+      }
     } catch {
       /* ignore parse errors or storage access */
     }
@@ -554,7 +542,10 @@ function SearchHome() {
     setSelectedPlatforms((prev) => ({ ...prev, [id]: !prev[id] }))
   }
 
-  const fetchSearchPage = async (q: string, page: number) => {
+  /**
+   * 拉取一页结果；顺序完全由后端 ``sort`` 决定，此处不对 ``results`` 做任何 `.sort()`。
+   */
+  const fetchSearchPage = async (q: string, page: number, sortOverride?: SortOrder) => {
     const trimmed = q.trim()
     if (!trimmed) return
 
@@ -571,11 +562,13 @@ function SearchHome() {
       const platformsParam =
         enabledPlatformIds.length === PLATFORM_IDS.length ? 'all' : enabledPlatformIds.join(',')
 
+      const sortKey = mapSortOrderToApi(sortOverride ?? sortOrder)
       const qs = new URLSearchParams({
         q: trimmed,
         page: String(page),
         platforms: platformsParam,
         condition: conditionFilter,
+        sort: sortKey,
       })
       const res = await fetch(`/api/search?${qs.toString()}`)
       if (!res.ok) {
@@ -597,9 +590,17 @@ function SearchHome() {
       } catch {
         /* quota / private mode */
       }
+      const resolvedQuery = (data.query && String(data.query).trim()) || trimmed
+      setQuery(resolvedQuery)
+      setSubmittedQuery(resolvedQuery)
       setListings(data.results)
       setCurrentPage(data.page ?? page)
       setHasMore(Boolean(data.has_more))
+      if (typeof data.sort === 'string') {
+        if (data.sort === 'relevance') setSortOrder('default')
+        else if (data.sort === 'price_asc' || data.sort === 'price_desc')
+          setSortOrder(data.sort)
+      }
       setActiveFilters({
         platformIds: [...enabledPlatformIds],
         condition: conditionFilter,
@@ -615,14 +616,14 @@ function SearchHome() {
     }
   }
 
-  /** 新关键词搜索：回到第 1 页 */
+  /** 新关键词搜索：回到第 1 页，相关度优先（须传入 override，避免 ``setSortOrder`` 尚未提交仍用上一次的排序） */
   const runSearchWithQuery = (q: string) => {
     const trimmed = q.trim()
     if (!trimmed) return
     setSubmittedQuery(trimmed)
     setCurrentPage(1)
     setSortOrder('default')
-    void fetchSearchPage(trimmed, 1)
+    void fetchSearchPage(trimmed, 1, 'default')
   }
 
   const handleSubmitSearch = () => {
@@ -638,6 +639,13 @@ function SearchHome() {
     }
     setCurrentPage(page)
     void fetchSearchPage(submittedQuery, page)
+  }
+
+  const handleSortChange = (order: SortOrder) => {
+    setSortOrder(order)
+    if (!submittedQuery || loading) return
+    setCurrentPage(1)
+    void fetchSearchPage(submittedQuery, 1, order)
   }
 
   const showResults = submittedQuery !== null
@@ -762,17 +770,17 @@ function SearchHome() {
             >
               <p className="min-h-[1.375rem] flex-1 text-center text-sm font-medium text-slate-500 dark:text-slate-400 sm:min-w-0 sm:text-left">
                 {loading && '正在搜寻全球货源…'}
-                {!loading && displayedListings.length > 0 && (
-                  <>🔍 为您找到 {displayedListings.length} 个全球淘琴结果</>
+                {!loading && listings.length > 0 && (
+                  <>🔍 为您找到 {listings.length} 个全球淘琴结果</>
                 )}
-                {!loading && displayedListings.length === 0 && '未找到相关吉他，尝试换个关键词试试？'}
+                {!loading && listings.length === 0 && '未找到相关吉他，尝试换个关键词试试？'}
               </p>
-              {displayedListings.length > 0 && (
+              {submittedQuery && (
                 <div className="flex shrink-0 flex-col items-center gap-1 sm:items-end">
                   <span className="text-[11px] font-medium uppercase tracking-wider text-slate-400 dark:text-slate-500">
                     排序
                   </span>
-                  <SortOrderMenu value={sortOrder} onChange={setSortOrder} disabled={loading} />
+                  <SortOrderMenu value={sortOrder} onChange={handleSortChange} disabled={loading} />
                 </div>
               )}
             </div>
@@ -783,7 +791,7 @@ function SearchHome() {
           {!loading && listings.length > 0 && (
             <section className="mt-4" aria-label="搜索结果">
               <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
-                {displayedListings.map((item, index) => (
+                {listings.map((item, index) => (
                   <SearchResultListingCard
                     key={item.url ? `${item.url}-${index}` : `row-${index}`}
                     item={item}

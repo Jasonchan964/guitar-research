@@ -18,6 +18,8 @@ export type UnifiedSearchApiResponse = {
   query: string
   page: number
   has_more: boolean
+  /** 后端实际采用的排序：``relevance`` | ``price_desc`` | ``price_asc`` */
+  sort?: string
   results: UnifiedListing[]
 }
 
@@ -31,6 +33,7 @@ export type ReverbListing = {
 
 export type ReverbSearchApiResponse = {
   query: string
+  sort?: string
   results: ReverbListing[]
 }
 
