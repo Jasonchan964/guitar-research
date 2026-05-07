@@ -4,7 +4,7 @@
 汇率来源：Frankfurter（欧洲央行参考汇率，免费、无需 API Key）
 文档：https://www.frankfurter.app/docs/
 
-另：`GET /search` 使用 Reverb API（环境变量 ``REVERB_API_TOKEN`` 优先，其次 ``REVERB_TOKEN``）。
+另：`GET /search` 与 ``scrape_reverb`` 使用 Reverb API，仅读取环境变量 ``REVERB_API_TOKEN``。
 `GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
@@ -30,6 +30,13 @@ from env_load import load_project_dotenv
 
 load_project_dotenv()
 
+_reverb_tok = (os.environ.get("REVERB_API_TOKEN") or "").strip()
+_reverb_preview = f"{_reverb_tok[:8]}***" if _reverb_tok else "未检测到"
+print(
+    f"=== [系统启动检查] Reverb Token 状态: {_reverb_preview} ===",
+    flush=True,
+)
+
 from exchange_rate_cache import get_usd_cny_rate_cached
 from guitar_detail import fetch_guitar_detail
 
@@ -40,6 +47,7 @@ if not logging.root.handlers:
     )
 logger = logging.getLogger(__name__)
 from reverb_client import (
+    REVERB_LISTINGS_PER_PAGE_DEFAULT,
     extract_first_photo_url,
     extract_listing_web_url,
     listing_to_search_item,
@@ -58,8 +66,9 @@ DIGIMART_SEARCH = f"{DIGIMART_ORIGIN}/search"
 # 分页：站点认 ``currentPage``；若仅用 ``page``/``currentPageNo`` 而不带 ``currentPage``，可能始终返回第 1 页列表
 DIGIMART_PRODUCT_TYPE_NEW = "NEW"
 DIGIMART_PRODUCT_TYPE_USED = "USED"
-# Reverb ``per_page`` 与列表「满页」启发式；Digimart 搜索页常见每页 20 条
-REVERB_PER_PAGE = 24
+# Reverb ``per_page``（与 ``reverb_client.REVERB_LISTINGS_PER_PAGE_DEFAULT`` 一致）与列表「满页」启发式
+REVERB_PER_PAGE = REVERB_LISTINGS_PER_PAGE_DEFAULT
+# Digimart 搜索页常见每页 20 条
 DIGIMART_PER_PAGE = 20
 # 常见桌面 Chrome UA，降低被站点拒绝的概率（仍需遵守对方 robots/条款）
 DIGIMART_BROWSER_HEADERS = {
@@ -1587,12 +1596,17 @@ def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str 
 
 
 def _reverb_api_token() -> str:
-    """个人 PAT：优先 ``REVERB_API_TOKEN``，兼容历史 ``REVERB_TOKEN``。"""
-    for key in ("REVERB_API_TOKEN", "REVERB_TOKEN"):
-        t = (os.environ.get(key) or "").strip()
-        if t:
-            return t
-    return ""
+    """Reverb 官方 Personal Access Token，仅从 ``REVERB_API_TOKEN`` 读取。"""
+    return (os.environ.get("REVERB_API_TOKEN") or "").strip()
+
+
+def _reverb_official_request_headers(token: str) -> dict[str, str]:
+    """与 Reverb 官方要求一致：Bearer、``application/vnd.reverb.v2+json``、JSON Content-Type。"""
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.reverb.v2+json",
+        "Content-Type": "application/json",
+    }
 
 
 async def scrape_reverb(
@@ -1602,23 +1616,30 @@ async def scrape_reverb(
     condition: str = "all",
 ) -> list[dict[str, Any]]:
     """
-    通过 Reverb 官方 API（Bearer PAT）拉取列表；非 2xx 时在终端打印状态码与 body 便于排查 401/429。
+    通过 Reverb 官方 API（Bearer PAT）拉取列表；失败原因见 ``reverb_client`` 内终端调试输出。
+
+    **Token / Headers**：仅 ``REVERB_API_TOKEN``；请求头由 ``_reverb_official_request_headers`` 与官方文档对齐。
 
     - Base URL：``https://api.reverb.com/api/listings``
-    - 翻页：``page``
-    - 成色：``all`` 不传 ``conditions[]``；``new`` → ``conditions[]=new``；``used`` → ``conditions[]=used``
+    - Params：``query``、``page``、``per_page``（默认 24）；成色 ``new``/``used`` 时追加 ``conditions[]``
     """
     q = keyword.strip()
     if not q:
         logger.info("[Reverb] scrape_reverb skipped (empty keyword)")
         return []
 
-    token = _reverb_api_token()
+    token = os.environ.get("REVERB_API_TOKEN", "").strip()
     if not token:
+        print(
+            "⚠️ [警告] 未从环境变量中检测到 REVERB_API_TOKEN，Reverb 搜索可能失效！",
+            flush=True,
+        )
         logger.warning(
-            "[Reverb] scrape_reverb skipped: set REVERB_API_TOKEN or REVERB_TOKEN in backend/.env",
+            "[Reverb] scrape_reverb skipped: missing REVERB_API_TOKEN in environment",
         )
         return []
+
+    headers = _reverb_official_request_headers(token)
 
     pg = max(1, int(page))
     cond = normalize_condition_param(condition)
@@ -1631,29 +1652,10 @@ async def scrape_reverb(
             page=pg,
             per_page=REVERB_PER_PAGE,
             condition=cond,
+            request_headers=headers,
         )
-    except httpx.HTTPStatusError as e:
-        resp = e.response
-        if resp is not None:
-            print(
-                f"Reverb API Error: {resp.status_code}, Response: {resp.text}",
-                flush=True,
-            )
-            logger.error(
-                "[Reverb] HTTPStatusError status=%s url=%s",
-                resp.status_code,
-                resp.url,
-            )
-        else:
-            print(f"Reverb API Error: (no response) {e!s}", flush=True)
-            logger.error("[Reverb] HTTPStatusError without response: %s", e)
-        return []
-    except httpx.HTTPError as e:
-        print(f"Reverb API Error: HTTPError {e!s}", flush=True)
-        logger.error("[Reverb] HTTPError: %s", e, exc_info=True)
-        return []
     except Exception as e:
-        print(f"Reverb API Error: {type(e).__name__}: {e!s}", flush=True)
+        print(f"💥 [Reverb 异常] scrape_reverb 未预期错误: {e}", flush=True)
         logger.error("[Reverb] scrape_reverb unexpected: %s", e, exc_info=True)
         return []
 
@@ -1864,41 +1866,23 @@ async def search_reverb(
 
     前端默认使用 ``GET /api/search``（含 Digimart）；本路由保留给仅需 Reverb 的调用方。
 
-    需在 ``backend/.env`` 中配置 ``REVERB_API_TOKEN`` 或 ``REVERB_TOKEN``（Personal Access Token）。
+    需在 ``backend/.env`` 中配置 ``REVERB_API_TOKEN``（Personal Access Token）。
     """
     token = _reverb_api_token()
     if not token:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "未配置 Reverb PAT。请在 backend/.env 中设置 REVERB_API_TOKEN=… "
-                "或 REVERB_TOKEN=…"
-            ),
+            detail="未配置 REVERB_API_TOKEN。请在 backend/.env 中设置 REVERB_API_TOKEN=你的令牌",
         )
 
-    try:
-        raw = await search_reverb_listings_async(
-            token,
-            q.strip(),
-            page=1,
-            per_page=REVERB_PER_PAGE,
-            condition="all",
-        )
-    except httpx.HTTPStatusError as e:
-        resp = e.response
-        if resp is not None:
-            print(
-                f"Reverb API Error: {resp.status_code}, Response: {resp.text}",
-                flush=True,
-            )
-        detail = resp.text[:500] if resp else str(e)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Reverb API 返回 {resp.status_code if resp else '?'}: {detail}",
-        ) from e
-    except httpx.HTTPError as e:
-        print(f"Reverb API Error: HTTPError {e!s}", flush=True)
-        raise HTTPException(status_code=502, detail=f"请求 Reverb 失败: {e}") from e
+    raw = await search_reverb_listings_async(
+        token,
+        q.strip(),
+        page=1,
+        per_page=REVERB_PER_PAGE,
+        condition="all",
+        request_headers=_reverb_official_request_headers(token),
+    )
 
     results = [listing_to_search_item(item) for item in raw]
     return {"query": q.strip(), "results": results}

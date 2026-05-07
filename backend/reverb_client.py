@@ -11,9 +11,13 @@ from typing import Any
 import httpx
 
 REVERB_API_ROOT = "https://api.reverb.com"
-# 市场搜索列表（与官方分页文档一致）：``GET /api/listings?page=…``
+# 官方标准列表搜索终结点（GET）：仅使用 ``query`` / ``page`` / ``per_page`` / ``conditions[]``
 REVERB_LISTINGS_SEARCH_URL = f"{REVERB_API_ROOT}/api/listings"
 REVERB_WEB_ORIGIN = "https://reverb.com"
+
+# 与搜索合并接口约定一致：每页 24 条
+REVERB_LISTINGS_PER_PAGE_DEFAULT = 24
+REVERB_HTTP_TIMEOUT_SEC = 10.0
 
 
 def reverb_request_headers(access_token: str) -> dict[str, str]:
@@ -111,8 +115,14 @@ def _reverb_listings_query_params(
     condition: str = "all",
 ) -> list[tuple[str, str | int]]:
     """
-    查询参数：``page``、``query``、``per_page``；成色为 ``new``/``used`` 时追加 ``conditions[]``。
-    使用元组列表以便稳定编码 ``conditions[]=…``。
+    Reverb ``GET /api/listings`` 查询串（键名必须与官方一致）：
+
+    - ``query``：搜索词（**不得**使用 ``q``）
+    - ``page``：页码（从 1 起）
+    - ``per_page``：每页条数（默认 24）
+    - ``conditions[]``：仅当 ``condition`` 为 ``new`` / ``used`` 时追加；``all`` 不带任何 conditions
+
+    使用 ``list[tuple]`` 以便稳定生成 ``conditions[]=…`` 数组形式。
     """
     q = query.strip()
     cond = (condition or "all").strip().lower()
@@ -133,21 +143,47 @@ def search_reverb_listings_sync(
     query: str,
     *,
     page: int = 1,
-    per_page: int = 24,
+    per_page: int = REVERB_LISTINGS_PER_PAGE_DEFAULT,
     condition: str = "all",
+    request_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     ``GET https://api.reverb.com/api/listings``，返回原始 ``listings`` 数组（每项为 HAL 风格对象）。
     """
-    headers = reverb_request_headers(access_token)
+    headers = (
+        request_headers if request_headers is not None else reverb_request_headers(access_token)
+    )
     params = _reverb_listings_query_params(
         query, page=page, per_page=per_page, condition=condition
     )
 
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        r = client.get(REVERB_LISTINGS_SEARCH_URL, headers=headers, params=params)
-        r.raise_for_status()
-        data = r.json()
+    try:
+        with httpx.Client(
+            timeout=REVERB_HTTP_TIMEOUT_SEC,
+            follow_redirects=True,
+        ) as client:
+            response = client.get(
+                REVERB_LISTINGS_SEARCH_URL,
+                headers=headers,
+                params=params,
+            )
+        if response.status_code != 200:
+            print(
+                f"❌ [Reverb API 错误] 状态码: {response.status_code} | 返回内容: {response.text}",
+                flush=True,
+            )
+            return []
+        try:
+            data = response.json()
+        except Exception as je:
+            print(
+                f"❌ [Reverb API 错误] HTTP 200 但 JSON 解析失败: {je} | 正文: {(response.text or '')[:1200]}",
+                flush=True,
+            )
+            return []
+    except Exception as e:
+        print(f"💥 [Reverb 异常] 请求发生错误: {e}", flush=True)
+        return []
 
     return _extract_listings_from_reverb_payload(data)
 
@@ -157,19 +193,45 @@ async def search_reverb_listings_async(
     query: str,
     *,
     page: int = 1,
-    per_page: int = 24,
+    per_page: int = REVERB_LISTINGS_PER_PAGE_DEFAULT,
     condition: str = "all",
+    request_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """异步版本，供 FastAPI 路由使用。"""
-    headers = reverb_request_headers(access_token)
+    """异步版本，供 FastAPI 路由使用。``request_headers`` 若传入则优先（须含 Bearer / Accept v2）。"""
+    headers = (
+        request_headers if request_headers is not None else reverb_request_headers(access_token)
+    )
     params = _reverb_listings_query_params(
         query, page=page, per_page=per_page, condition=condition
     )
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        r = await client.get(REVERB_LISTINGS_SEARCH_URL, headers=headers, params=params)
-        r.raise_for_status()
-        data = r.json()
+    try:
+        async with httpx.AsyncClient(
+            timeout=REVERB_HTTP_TIMEOUT_SEC,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(
+                REVERB_LISTINGS_SEARCH_URL,
+                headers=headers,
+                params=params,
+            )
+        if response.status_code != 200:
+            print(
+                f"❌ [Reverb API 错误] 状态码: {response.status_code} | 返回内容: {response.text}",
+                flush=True,
+            )
+            return []
+        try:
+            data = response.json()
+        except Exception as je:
+            print(
+                f"❌ [Reverb API 错误] HTTP 200 但 JSON 解析失败: {je} | 正文: {(response.text or '')[:1200]}",
+                flush=True,
+            )
+            return []
+    except Exception as e:
+        print(f"💥 [Reverb 异常] 请求发生错误: {e}", flush=True)
+        return []
 
     return _extract_listings_from_reverb_payload(data)
 

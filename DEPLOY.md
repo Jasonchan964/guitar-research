@@ -7,7 +7,7 @@
 1. **GitHub 账号**：把本文件夹 `guitar-search` 打成仓库并推送（代码里不要提交 `.env` / `.env.txt`）。
 2. **Render 账号**：[https://render.com](https://render.com) 用 GitHub 登录。
 3. **密钥**：在 Render 控制台 **Environment** 里配置（不要写进代码）：
-   - **`REVERB_TOKEN`**：Reverb Personal Access Token  
+   - **`REVERB_API_TOKEN`**：Reverb Personal Access Token  
    - **`EXCHANGE_RATE_API_KEY`**：[ExchangeRate-API](https://www.exchangerate-api.com/) 密钥（用于 **`/api/exchange-rate`**）
 
 ## 用 Blueprint 一键部署（推荐）
@@ -15,7 +15,7 @@
 1. Render 控制台：**New** → **Blueprint**。
 2. 连接你的 GitHub 仓库；若仓库根目录不是 `guitar-search`，请选择包含 `Dockerfile` 的子目录（或在 Blueprint 里指向正确路径）。
 3. 应用创建后，打开 **Environment**，新增密钥：
-   - **Key**：`REVERB_TOKEN`
+   - **Key**：`REVERB_API_TOKEN`
    - **Value**：你在 Reverb 后台生成的 Personal Access Token  
 4. 等待构建结束（首次 Docker 构建约几分钟）。
 5. 打开 Render 给你的域名，例如：**`https://guitar-search-xxxx.onrender.com`**（以控制台为准）。
