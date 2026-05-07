@@ -21,6 +21,22 @@
   animation: detail-cta-breathe 2.4s ease-in-out infinite;
 }
 
+@keyframes heart-pop {
+  0% {
+    transform: scale(0.88);
+  }
+  55% {
+    transform: scale(1.12);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.animate-heart-pop {
+  animation: heart-pop 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 body {
   margin: 0;
 }

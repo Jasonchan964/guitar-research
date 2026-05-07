@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import re
@@ -30,6 +31,16 @@ from env_load import load_project_dotenv
 
 load_project_dotenv()
 
+# 优先从环境变量读取（Render 等生产环境）；本地未配置时使用固定兜底密钥，须在导入依赖 JWT 的模块之前写入 os.environ
+_JWT_LOCAL_DEFAULT = "your-super-secret-key-for-local-development-ribo-precision"
+JWT_SECRET_KEY = (os.environ.get("JWT_SECRET_KEY") or "").strip() or _JWT_LOCAL_DEFAULT
+os.environ["JWT_SECRET_KEY"] = JWT_SECRET_KEY
+if JWT_SECRET_KEY == _JWT_LOCAL_DEFAULT:
+    print(
+        "[安全提示] 正在使用本地默认 JWT_SECRET_KEY。部署到 Render 生产环境时，请务必在环境变量中配置真实的 JWT_SECRET_KEY！",
+        flush=True,
+    )
+
 _reverb_tok = (os.environ.get("REVERB_API_TOKEN") or "").strip()
 _reverb_preview = f"{_reverb_tok[:8]}***" if _reverb_tok else "未检测到"
 print(
@@ -37,8 +48,11 @@ print(
     flush=True,
 )
 
+from database import init_db
 from exchange_rate_cache import get_usd_cny_rate_cached
 from guitar_detail import fetch_guitar_detail
+from routers.auth import router as auth_router
+from routers.favorites import router as favorites_router
 
 if not logging.root.handlers:
     logging.basicConfig(
@@ -147,32 +161,46 @@ GUITARGUITAR_BROWSER_HEADERS = {
     'Sec-Ch-Ua-Platform': '"Windows"',
 }
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="Guitar Search API",
     version="0.1.0",
+    lifespan=lifespan,
     # 生产环境由 StaticFiles 托管根路径时，避免 /docs 与前端路由混淆
     docs_url=None if HAS_FRONTEND else "/docs",
     redoc_url=None if HAS_FRONTEND else "/redoc",
 )
 
-_cors_origins = [
-    "http://127.0.0.1:5173",
+# 允许跨域的源列表（Vite 预览常用端口、本地 React 脚手架 + 环境变量追加）
+origins = [
     "http://localhost:5173",
-    "http://127.0.0.1:5174",
+    "http://127.0.0.1:5173",
     "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
 for _piece in os.getenv("ALLOWED_ORIGINS", "").split(","):
     _p = _piece.strip()
-    if _p and _p not in _cors_origins:
-        _cors_origins.append(_p)
+    if _p and _p not in origins:
+        origins.append(_p)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
+app.include_router(favorites_router)
 
 
 async def fetch_cny_rate(client: httpx.AsyncClient, currency: str) -> float:

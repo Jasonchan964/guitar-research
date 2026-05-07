@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import type { GuitarDetailApi } from './mockGuitars'
+import FavoriteHeart from './components/FavoriteHeart'
+import NavUserMenu from './components/NavUserMenu'
 
 const PLACEHOLDER_IMG =
   'data:image/svg+xml,' +
@@ -30,14 +32,15 @@ function GuitarDetailInvalidParams() {
   return (
     <div className="min-h-svh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
       <header className="border-b border-slate-200/80 bg-white/95 px-4 py-3 backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/95">
-        <div className="mx-auto max-w-3xl">
+        <div className="mx-auto flex max-w-3xl items-center justify-between gap-3">
           <Link
             to="/"
-            className="inline-flex items-center gap-1 text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+            className="inline-flex shrink-0 items-center gap-1 text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
           >
             <ChevronLeft className="h-4 w-4" strokeWidth={2.5} aria-hidden />
             返回搜索
           </Link>
+          <NavUserMenu compact />
         </div>
       </header>
       <main className="mx-auto max-w-3xl px-4 py-10 text-center text-sm text-slate-600 dark:text-slate-400">
@@ -121,7 +124,7 @@ function GuitarDetailLoaded({ url, platform }: { url: string; platform: string }
   return (
     <div className="min-h-svh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
       <header className="sticky top-0 z-40 border-b border-slate-200/80 bg-white/95 px-4 py-3 backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/95">
-        <div className="mx-auto flex max-w-3xl items-center gap-3">
+        <div className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-3 gap-y-2">
           <Link
             to="/"
             className="inline-flex shrink-0 items-center gap-1 text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
@@ -131,11 +134,14 @@ function GuitarDetailLoaded({ url, platform }: { url: string; platform: string }
           </Link>
           {data ? (
             <span
-              className={`ml-auto inline-flex max-w-[min(100%,12rem)] truncate rounded-full border px-3 py-1 text-xs font-semibold sm:max-w-xs sm:text-sm ${pillClass}`}
+              className={`inline-flex max-w-[min(100%,12rem)] truncate rounded-full border px-3 py-1 text-xs font-semibold sm:max-w-xs sm:text-sm ${pillClass}`}
             >
               {data.platform}
             </span>
           ) : null}
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <NavUserMenu compact />
+          </div>
         </div>
       </header>
 
@@ -216,9 +222,23 @@ function GuitarDetailLoaded({ url, platform }: { url: string; platform: string }
               ) : null}
             </div>
 
-            <h1 className="mt-6 text-xl font-semibold leading-snug text-slate-900 dark:text-slate-50 sm:text-2xl">
-              {data.title}
-            </h1>
+            <div className="relative mt-6 pr-11 sm:pr-12">
+              <h1 className="text-xl font-semibold leading-snug text-slate-900 dark:text-slate-50 sm:text-2xl">
+                {data.title}
+              </h1>
+              {data.buy_url ? (
+                <FavoriteHeart
+                  className="right-0 top-0"
+                  item={{
+                    title: data.title,
+                    price_cny: data.price_cny,
+                    image: data.images[0] ?? null,
+                    original_url: data.buy_url,
+                    platform: data.platform,
+                  }}
+                />
+              ) : null}
+            </div>
 
             <dl className="mt-4 space-y-2 text-sm">
               <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">

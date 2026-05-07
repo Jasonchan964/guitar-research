@@ -7,20 +7,28 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# 忽略本地数据库（极其重要！）
+*.db
+*.sqlite3
 
-# Python
-__pycache__/
-*.py[cod]
-
-# Secrets
+# 忽略本地环境变量与临时密钥文件
 .env
+.env.local
 .env.*
 .env.txt
 !.env.example
+
+# 忽略 Python 缓存和虚拟环境
+__pycache__/
+.venv/
+*.py[cod]
+
+# 忽略前端依赖和打包产物
+node_modules/
+dist/
+dist-ssr
+
+*.local
 
 # Editor directories and files
 .vscode/*

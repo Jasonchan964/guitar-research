@@ -3,6 +3,10 @@ import { Link, Route, Routes } from 'react-router-dom'
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react'
 import type { UnifiedListing, UnifiedSearchApiResponse } from './mockGuitars'
 import GuitarDetailPage from './GuitarDetailPage'
+import AuthModal from './components/AuthModal'
+import AuthToasts from './components/AuthToasts'
+import FavoriteHeart from './components/FavoriteHeart'
+import NavUserMenu from './components/NavUserMenu'
 
 const PLACEHOLDER_IMG =
   'data:image/svg+xml,' +
@@ -735,7 +739,8 @@ function SearchHome() {
     <div className="min-h-svh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
       {!showResults ? (
         <header className="border-b border-slate-200/60 bg-white/80 px-4 py-3 backdrop-blur-sm dark:border-slate-800 dark:bg-slate-950/80">
-          <div className="mx-auto flex max-w-5xl items-center justify-end">
+          <div className="mx-auto flex max-w-5xl items-center justify-end gap-3">
+            <NavUserMenu />
             <CurrencyToggle currency={currency} onChange={setCurrency} />
           </div>
         </header>
@@ -751,7 +756,8 @@ function SearchHome() {
                   1 USD ≈ {exchangeRate.toFixed(4)} CNY
                 </p>
               )}
-              <div className="sm:hidden">
+              <div className="flex items-center gap-2 sm:hidden">
+                <NavUserMenu compact />
                 <CurrencyToggle currency={currency} onChange={setCurrency} compact />
               </div>
             </div>
@@ -764,7 +770,8 @@ function SearchHome() {
                 onSubmitSearch={handleSubmitSearch}
               />
             </div>
-            <div className="hidden shrink-0 sm:block">
+            <div className="hidden shrink-0 sm:flex sm:flex-col sm:items-end sm:gap-2">
+              <NavUserMenu compact />
               <CurrencyToggle currency={currency} onChange={setCurrency} compact />
             </div>
           </div>
@@ -873,55 +880,70 @@ function SearchHome() {
                   <li key={item.url ? `${item.url}-${index}` : `row-${index}`} className="min-w-0">
                     <article className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200/90 bg-white shadow-sm transition-shadow duration-200 hover:shadow-md md:rounded-2xl dark:border-slate-700/90 dark:bg-slate-900">
                       {item.url ? (
-                        <Link
-                          to={`/guitar?${new URLSearchParams({ url: item.url, platform: item.source }).toString()}`}
-                          className="flex min-h-0 min-w-0 flex-1 flex-col text-left outline-none transition-[box-shadow] focus-visible:ring-2 focus-visible:ring-blue-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-slate-900"
-                        >
-                        <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
-                          <img
-                            src={item.image || PLACEHOLDER_IMG}
-                            alt=""
-                            className="h-full w-full object-cover object-center"
-                            loading="lazy"
-                            width={640}
-                            height={480}
-                          />
-                        </div>
-                        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 p-3 sm:gap-2 sm:p-4 md:gap-2.5 md:p-5">
-                          <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
-                            {item.title}
-                          </h2>
-                          <p className="flex shrink-0 flex-wrap items-center gap-1.5">
-                            <span
-                              className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-medium sm:px-2.5 sm:text-xs ${SOURCE_PILL_CLASS[item.source] ?? SOURCE_PILL_FALLBACK}`}
+                        <>
+                          <div className="relative aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
+                            <Link
+                              to={`/guitar?${new URLSearchParams({ url: item.url, platform: item.source }).toString()}`}
+                              className="block h-full w-full outline-none transition-[box-shadow] focus-visible:ring-2 focus-visible:ring-blue-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-slate-900"
                             >
-                              {item.source}
-                            </span>
-                            <span
-                              className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${
-                                item.condition === '全新'
-                                  ? 'border-emerald-200/90 bg-emerald-50 text-emerald-700 dark:border-emerald-800/60 dark:bg-emerald-950/45 dark:text-emerald-400'
-                                  : 'border-slate-200/90 bg-slate-100 text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400'
-                              }`}
-                            >
-                              {item.condition === '全新' ? '全新' : '二手'}
-                            </span>
-                          </p>
-                          <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
-                            <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
-                            <span className="min-w-0 max-w-full whitespace-nowrap text-sm font-bold sm:text-base">
-                              <UnifiedPriceDisplay
-                                priceUsd={item.price_usd}
-                                priceCny={item.price_cny}
-                                currency={currency}
+                              <img
+                                src={item.image || PLACEHOLDER_IMG}
+                                alt=""
+                                className="h-full w-full object-cover object-center"
+                                loading="lazy"
+                                width={640}
+                                height={480}
                               />
-                            </span>
-                          </p>
-                          <p className="mt-auto shrink-0 pt-1.5 text-[11px] font-medium text-slate-400 sm:pt-2 sm:text-xs dark:text-slate-500">
-                            站内详情页
-                          </p>
-                        </div>
-                        </Link>
+                            </Link>
+                            <FavoriteHeart
+                              className="right-2 top-2"
+                              item={{
+                                title: item.title,
+                                price_cny: item.price_cny,
+                                image: item.image,
+                                original_url: item.url,
+                                platform: item.source,
+                              }}
+                            />
+                          </div>
+                          <Link
+                            to={`/guitar?${new URLSearchParams({ url: item.url, platform: item.source }).toString()}`}
+                            className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 p-3 text-left outline-none transition-[box-shadow] focus-visible:ring-2 focus-visible:ring-blue-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-slate-900 sm:gap-2 sm:p-4 md:gap-2.5 md:p-5"
+                          >
+                            <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
+                              {item.title}
+                            </h2>
+                            <p className="flex shrink-0 flex-wrap items-center gap-1.5">
+                              <span
+                                className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-medium sm:px-2.5 sm:text-xs ${SOURCE_PILL_CLASS[item.source] ?? SOURCE_PILL_FALLBACK}`}
+                              >
+                                {item.source}
+                              </span>
+                              <span
+                                className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${
+                                  item.condition === '全新'
+                                    ? 'border-emerald-200/90 bg-emerald-50 text-emerald-700 dark:border-emerald-800/60 dark:bg-emerald-950/45 dark:text-emerald-400'
+                                    : 'border-slate-200/90 bg-slate-100 text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                                }`}
+                              >
+                                {item.condition === '全新' ? '全新' : '二手'}
+                              </span>
+                            </p>
+                            <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
+                              <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
+                              <span className="min-w-0 max-w-full whitespace-nowrap text-sm font-bold sm:text-base">
+                                <UnifiedPriceDisplay
+                                  priceUsd={item.price_usd}
+                                  priceCny={item.price_cny}
+                                  currency={currency}
+                                />
+                              </span>
+                            </p>
+                            <p className="mt-auto shrink-0 pt-1.5 text-[11px] font-medium text-slate-400 sm:pt-2 sm:text-xs dark:text-slate-500">
+                              站内详情页
+                            </p>
+                          </Link>
+                        </>
                       ) : (
                         <div className="flex min-h-0 min-w-0 flex-1 flex-col text-left opacity-60">
                           <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
@@ -977,9 +999,13 @@ function SearchHome() {
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<SearchHome />} />
-      <Route path="/guitar" element={<GuitarDetailPage />} />
-    </Routes>
+    <>
+      <Routes>
+        <Route path="/" element={<SearchHome />} />
+        <Route path="/guitar" element={<GuitarDetailPage />} />
+      </Routes>
+      <AuthModal />
+      <AuthToasts />
+    </>
   )
 }
