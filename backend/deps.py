@@ -66,3 +66,33 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+async def get_current_user_optional(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(http_bearer)],
+    db: Annotated[Session, Depends(get_db)],
+) -> User | None:
+    """
+    可选登录：无 Bearer、无效或过期令牌时返回 ``None``，不抛出 401。
+    供搜索等「登录增强」接口与外部请求并发使用。
+    """
+    if creds is None or (creds.scheme or "").lower() != "bearer":
+        return None
+    token = creds.credentials
+    try:
+        data = decode_access_token(token)
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+    sub = data.get("sub")
+    if sub is None:
+        return None
+    try:
+        uid = int(sub)
+    except (TypeError, ValueError):
+        return None
+
+    user = db.get(User, uid)
+    return user

@@ -12,6 +12,8 @@ export type UnifiedListing = {
   all_images?: string[]
   /** 富文本 HTML（Shopify ``body_html``）；可能为空 */
   description?: string
+  /** 后端在已登录请求下根据收藏表填充 */
+  is_favorited?: boolean
 }
 
 export type UnifiedSearchApiResponse = {

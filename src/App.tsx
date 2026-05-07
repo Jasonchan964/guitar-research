@@ -589,7 +589,14 @@ function SearchHome() {
         sort: sortKey,
         session_id: getOrCreateSearchSessionId(),
       })
-      const res = await fetch(`/api/search?${qs.toString()}`)
+      const headers: HeadersInit = {}
+      try {
+        const tok = localStorage.getItem('token')
+        if (tok?.trim()) headers.Authorization = `Bearer ${tok.trim()}`
+      } catch {
+        /* private mode */
+      }
+      const res = await fetch(`/api/search?${qs.toString()}`, { headers })
       if (!res.ok) {
         const text = await res.text()
         let msg = text || `请求失败 (${res.status})`

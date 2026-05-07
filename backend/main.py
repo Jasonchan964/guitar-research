@@ -22,12 +22,13 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote_plus, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from sqlalchemy import select
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -52,7 +53,9 @@ print(
     flush=True,
 )
 
-from database import init_db
+from database import SessionLocal, init_db
+from deps import get_current_user_optional
+from url_normalize import normalize_original_url
 from exchange_rate_cache import get_usd_cny_rate_cached
 from guitar_detail import fetch_guitar_detail
 from routers.auth import router as auth_router
@@ -64,6 +67,8 @@ if not logging.root.handlers:
         format="%(levelname)s %(name)s: %(message)s",
     )
 logger = logging.getLogger(__name__)
+
+from models import Favorite, User
 from reverb_client import (
     REVERB_LISTINGS_PER_PAGE_DEFAULT,
     extract_first_photo_url,
@@ -93,6 +98,27 @@ SEARCH_PAGE_SIZE = REVERB_PER_PAGE
 SEARCH_MERGE_MAX_ROUNDS = 15
 # Digimart 搜索页常见每页 20 条
 DIGIMART_PER_PAGE = 20
+# 勾选 Reverb 时与平台抓取 **并发** 预取的常见标价 ISO（极少数币种在结果汇总后再补一次请求）
+REVERB_PREFETCH_CURRENCIES: frozenset[str] = frozenset(
+    (
+        "EUR",
+        "GBP",
+        "CAD",
+        "AUD",
+        "JPY",
+        "CHF",
+        "MXN",
+        "NZD",
+        "SEK",
+        "NOK",
+        "DKK",
+        "PLN",
+        "ILS",
+        "KRW",
+        "SGD",
+        "HKD",
+    )
+)
 # 常见桌面 Chrome UA，降低被站点拒绝的概率（仍需遵守对方 robots/条款）
 DIGIMART_BROWSER_HEADERS = {
     "User-Agent": (
@@ -237,6 +263,45 @@ async def get_rates_to_cny(client: httpx.AsyncClient, currencies: set[str]) -> d
     tasks = [fetch_cny_rate(client, c) for c in keys]
     values = await asyncio.gather(*tasks)
     return dict(zip(keys, values, strict=True))
+
+
+def _prefetch_currency_set_for_search(selected: set[str]) -> set[str]:
+    """按勾选平台推导「几乎可以确定会用到」的货币集合；与爬虫并发请求 Frankfurter。"""
+    s: set[str] = {"USD"}
+    if "digimart" in selected:
+        s.add("JPY")
+    if "guitarguitar" in selected:
+        s.add("GBP")
+    if "ishibashi" in selected:
+        s.add("JPY")
+    if "sweelee" in selected:
+        s.add("SGD")
+    if "reverb" in selected:
+        s.update(REVERB_PREFETCH_CURRENCIES)
+    return s
+
+
+def _load_favorite_normalized_urls_sync(user_id: int) -> frozenset[str]:
+    """同步读取用户收藏的规范化 URL（在 ``asyncio.to_thread`` 中与搜索并行）。"""
+    db = SessionLocal()
+    try:
+        rows = db.scalars(
+            select(Favorite.original_url_normalized).where(Favorite.user_id == user_id)
+        ).all()
+        return frozenset(str(x).strip() for x in rows if x and str(x).strip())
+    finally:
+        db.close()
+
+
+def _apply_favorite_flags(rows: list[dict[str, Any]], fav_urls: frozenset[str]) -> None:
+    """就地写入 ``is_favorited``（与收藏入库键 ``normalize_original_url`` 一致）。"""
+    if not fav_urls:
+        for r in rows:
+            r["is_favorited"] = False
+        return
+    for r in rows:
+        k = normalize_original_url(str(r.get("url") or ""))
+        r["is_favorited"] = bool(k and k in fav_urls)
 
 
 def _gbp_to_cny_rate(rates_map: dict[str, float]) -> float:
@@ -2157,7 +2222,8 @@ async def _merge_search_single_round(
     sort_norm: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """
-    抓取 ``fetch_page`` 对应的一轮（每站同一页码）：五路并发 → 合并 → **本轮内** URL 去重 → 成色过滤。
+    抓取 ``fetch_page`` 对应的一轮（每站同一页码）：各平台请求彼此并发，
+    **且与 Frankfurter 汇率预取并发**（``asyncio.gather``）；合并后 **本轮内** URL 去重 → 成色过滤。
     第三方接口在支持时携带排序参数（Reverb ``order``、Digimart ``sortKey``）。
 
     返回 ``(results, has_more)``；若所有平台原始列表均为空则 ``([], False)``。
@@ -2187,119 +2253,125 @@ async def _merge_search_single_round(
         coros.append(_safe_scrape_sweelee(q_clean, pg))
         labels.append("sweelee")
 
-    gathered = await asyncio.gather(*coros, return_exceptions=True)
+    prefetch_cur = _prefetch_currency_set_for_search(selected)
+    async with httpx.AsyncClient(timeout=20.0) as fx_client:
+        gathered, rates_map = await asyncio.gather(
+            asyncio.gather(*coros, return_exceptions=True),
+            get_rates_to_cny(fx_client, prefetch_cur),
+        )
 
-    raw_rev: list[dict[str, Any]] = []
-    digi_raw: list[dict[str, Any]] = []
-    gg_raw: list[dict[str, Any]] = []
-    ishi_raw: list[dict[str, Any]] = []
-    swee_raw: list[dict[str, Any]] = []
+        raw_rev: list[dict[str, Any]] = []
+        digi_raw: list[dict[str, Any]] = []
+        gg_raw: list[dict[str, Any]] = []
+        ishi_raw: list[dict[str, Any]] = []
+        swee_raw: list[dict[str, Any]] = []
 
-    for name, out in zip(labels, gathered):
-        if name == "reverb":
-            if isinstance(out, list):
-                raw_rev = out
-            else:
-                if isinstance(out, BaseException):
-                    logger.error(
-                        "[api/search] Reverb task raised unexpectedly: %r",
-                        out,
-                        exc_info=(type(out), out, out.__traceback__),
-                    )
+        for name, out in zip(labels, gathered):
+            if name == "reverb":
+                if isinstance(out, list):
+                    raw_rev = out
+                else:
+                    if isinstance(out, BaseException):
+                        logger.error(
+                            "[api/search] Reverb task raised unexpectedly: %r",
+                            out,
+                            exc_info=(type(out), out, out.__traceback__),
+                        )
+                    else:
+                        logger.error(
+                            "[api/search] Reverb task returned non-list: %r",
+                            out,
+                        )
+                continue
+            if name == "digimart":
+                if isinstance(out, list):
+                    digi_raw = out
                 else:
                     logger.error(
-                        "[api/search] Reverb task returned non-list: %r",
+                        "[api/search] Digimart task returned non-list (unexpected): %r",
                         out,
+                        exc_info=(
+                            (type(out), out, out.__traceback__)
+                            if isinstance(out, BaseException)
+                            else None
+                        ),
                     )
-            continue
-        if name == "digimart":
-            if isinstance(out, list):
-                digi_raw = out
-            else:
-                logger.error(
-                    "[api/search] Digimart task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
-            continue
-        if name == "guitarguitar":
-            if isinstance(out, list):
-                gg_raw = out
-            else:
-                logger.error(
-                    "[api/search] GuitarGuitar task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
-            continue
-        if name == "ishibashi":
-            if isinstance(out, list):
-                ishi_raw = out
-            else:
-                logger.error(
-                    "[api/search] Ishibashi task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
-            continue
-        if name == "sweelee":
-            if isinstance(out, list):
-                swee_raw = out
-            else:
-                logger.error(
-                    "[api/search] Swee Lee task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
+                continue
+            if name == "guitarguitar":
+                if isinstance(out, list):
+                    gg_raw = out
+                else:
+                    logger.error(
+                        "[api/search] GuitarGuitar task returned non-list (unexpected): %r",
+                        out,
+                        exc_info=(
+                            (type(out), out, out.__traceback__)
+                            if isinstance(out, BaseException)
+                            else None
+                        ),
+                    )
+                continue
+            if name == "ishibashi":
+                if isinstance(out, list):
+                    ishi_raw = out
+                else:
+                    logger.error(
+                        "[api/search] Ishibashi task returned non-list (unexpected): %r",
+                        out,
+                        exc_info=(
+                            (type(out), out, out.__traceback__)
+                            if isinstance(out, BaseException)
+                            else None
+                        ),
+                    )
+                continue
+            if name == "sweelee":
+                if isinstance(out, list):
+                    swee_raw = out
+                else:
+                    logger.error(
+                        "[api/search] Swee Lee task returned non-list (unexpected): %r",
+                        out,
+                        exc_info=(
+                            (type(out), out, out.__traceback__)
+                            if isinstance(out, BaseException)
+                            else None
+                        ),
+                    )
 
-    if not raw_rev and not digi_raw and not gg_raw and not ishi_raw and not swee_raw:
-        return [], False
+        if not raw_rev and not digi_raw and not gg_raw and not ishi_raw and not swee_raw:
+            return [], False
 
-    has_more = (
-        ("reverb" in selected and len(raw_rev) >= REVERB_PER_PAGE)
-        or ("digimart" in selected and len(digi_raw) >= DIGIMART_PER_PAGE)
-        or ("guitarguitar" in selected and len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
-        or ("ishibashi" in selected and len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
-        or ("sweelee" in selected and len(swee_raw) >= SWEELEE_HAS_MORE_HINT)
-    )
+        has_more = (
+            ("reverb" in selected and len(raw_rev) >= REVERB_PER_PAGE)
+            or ("digimart" in selected and len(digi_raw) >= DIGIMART_PER_PAGE)
+            or ("guitarguitar" in selected and len(gg_raw) >= GUITARGUITAR_FULL_PAGE)
+            or ("ishibashi" in selected and len(ishi_raw) >= ISHIBASHI_HAS_MORE_HINT)
+            or ("sweelee" in selected and len(swee_raw) >= SWEELEE_HAS_MORE_HINT)
+        )
 
-    currencies: set[str] = {"USD"}
-    for listing in raw_rev:
-        _, cur = _reverb_amount_currency(listing)
-        if cur:
-            currencies.add(cur)
-    if digi_raw:
-        currencies.add("JPY")
-    for ib in ishi_raw:
-        ic = _ishibashi_normalize_iso_currency(ib.get("original_currency")) or "JPY"
-        currencies.add(ic)
-    if gg_raw:
-        currencies.add("GBP")
-    for sw in swee_raw:
-        sc = _ishibashi_normalize_iso_currency(sw.get("original_currency")) or "SGD"
-        currencies.add(sc)
+        currencies: set[str] = {"USD"}
+        for listing in raw_rev:
+            _, cur = _reverb_amount_currency(listing)
+            if cur:
+                currencies.add(cur)
+        if digi_raw:
+            currencies.add("JPY")
+        for ib in ishi_raw:
+            ic = _ishibashi_normalize_iso_currency(ib.get("original_currency")) or "JPY"
+            currencies.add(ic)
+        if gg_raw:
+            currencies.add("GBP")
+        for sw in swee_raw:
+            sc = _ishibashi_normalize_iso_currency(sw.get("original_currency")) or "SGD"
+            currencies.add(sc)
 
-    async with httpx.AsyncClient(timeout=20.0) as fx_client:
-        try:
-            rates_map = await get_rates_to_cny(fx_client, currencies)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"请求汇率服务失败: {e}") from e
+        missing_iso = currencies - set(rates_map.keys())
+        if missing_iso:
+            try:
+                rates_map.update(await get_rates_to_cny(fx_client, missing_iso))
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"请求汇率服务失败: {e}") from e
 
     try:
         usd_to_cny = rates_map["USD"]
@@ -2508,8 +2580,32 @@ async def _run_global_search(
     return window, has_more
 
 
+async def _api_search_collect_page(
+    *,
+    q_clean: str,
+    page_no: int,
+    selected: set[str],
+    cond_norm: str,
+    sort_norm: str,
+    sid_norm: str,
+    scope_sig: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    """单页聚合 + Reverb 跨页会话过滤。"""
+    results, has_more = await _run_global_search(
+        q_clean, page_no, selected, cond_norm, sort_norm
+    )
+    results = _apply_reverb_cross_page_session_filter(
+        results,
+        session_id=sid_norm or None,
+        scope_sig=scope_sig,
+        treats_all_as_reverb=False,
+    )
+    return results, has_more
+
+
 @app.get("/api/search")
 async def api_search(
+    current_user: Annotated[User | None, Depends(get_current_user_optional)],
     q: str = Query(
         "",
         description=(
@@ -2544,6 +2640,10 @@ async def api_search(
     """
     按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
 
+    性能：**各平台爬虫**与 **Frankfurter 汇率预取**在同一轮 ``asyncio.gather`` 中并发；若请求携带
+    ``Authorization: Bearer``，则 **收藏 URL 数据库查询** 与 **第一轮搜索聚合** 再并发，
+    总耗时更接近「最慢的一项」而非逐项相加。
+
     Digimart：``condition=new|used`` 时先在请求上加 ``productTypes``（新品/中古），再解析列表；
     Reverb：``condition=new|used`` 时在 API 上追加 ``conditions[]=new|used``，``all`` 不传该参数；
     合并后仍按 ``condition`` 做一次全局成色过滤。
@@ -2557,7 +2657,7 @@ async def api_search(
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
     ``url`` / ``condition``（``全新`` 或 ``二手``）/ ``all_images``（图片 URL 数组）/
-    ``description``（商品详情 HTML，无则为空串）。
+    ``description``（商品详情 HTML，无则为空串）/ ``is_favorited``（已登录且 URL 在收藏夹时为真）。
     """
     q_clean = q.strip()
     sort_norm = normalize_sort_param(sort)
@@ -2586,39 +2686,40 @@ async def api_search(
     )
 
     logger.info(
-        "[api/search] start query=%r page=%s platforms=%s condition=%s sort=%s sid=%s",
+        "[api/search] start query=%r page=%s platforms=%s condition=%s sort=%s sid=%s user=%s",
         q_clean,
         page_no,
         sorted(selected),
         cond_norm,
         sort_norm,
         bool(sid_norm),
+        current_user.id if current_user else None,
     )
 
-    results, has_more = await _run_global_search(
-        q_clean, page_no, selected, cond_norm, sort_norm
-    )
-    results = _apply_reverb_cross_page_session_filter(
-        results,
-        session_id=sid_norm or None,
+    page_kw = dict(
+        q_clean=q_clean,
+        selected=selected,
+        cond_norm=cond_norm,
+        sort_norm=sort_norm,
+        sid_norm=sid_norm,
         scope_sig=scope_sig,
-        treats_all_as_reverb=False,
     )
+    fav_urls: frozenset[str] = frozenset()
+    if current_user is not None:
+        (results, has_more), fav_urls = await asyncio.gather(
+            _api_search_collect_page(page_no=page_no, **page_kw),
+            asyncio.to_thread(_load_favorite_normalized_urls_sync, current_user.id),
+        )
+    else:
+        results, has_more = await _api_search_collect_page(page_no=page_no, **page_kw)
+
     effective_page = page_no
     page_adjusted = False
 
     if page_no > 1 and len(results) == 0:
         for step in range(1, API_SEARCH_EMPTY_PAGE_MAX_SKIP + 1):
             fp = page_no + step
-            results, has_more = await _run_global_search(
-                q_clean, fp, selected, cond_norm, sort_norm
-            )
-            results = _apply_reverb_cross_page_session_filter(
-                results,
-                session_id=sid_norm or None,
-                scope_sig=scope_sig,
-                treats_all_as_reverb=False,
-            )
+            results, has_more = await _api_search_collect_page(page_no=fp, **page_kw)
             if len(results) > 0:
                 effective_page = fp
                 page_adjusted = True
@@ -2628,6 +2729,8 @@ async def api_search(
                     fp,
                 )
                 break
+
+    _apply_favorite_flags(results, fav_urls)
 
     payload: dict[str, Any] = {
         "query": q_clean,
