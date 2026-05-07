@@ -11,6 +11,24 @@ import NavUserMenu from './components/NavUserMenu'
 import SearchResultListingCard from './components/SearchResultListingCard'
 
 const LAST_SEARCH_RESULTS_KEY = 'last_search_results'
+/** 与后端 ``session_id`` 对齐：同 Tab 会话内跨页剔除已下发的 Reverb URL（仅内存，进程内 TTL） */
+const SEARCH_SESSION_ID_KEY = 'guitar-search-session-id'
+
+function getOrCreateSearchSessionId(): string {
+  try {
+    let s = sessionStorage.getItem(SEARCH_SESSION_ID_KEY)
+    if (!s || s.length < 8) {
+      s =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `s${Date.now()}${Math.random().toString(36).slice(2, 14)}`
+      sessionStorage.setItem(SEARCH_SESSION_ID_KEY, s)
+    }
+    return s
+  } catch {
+    return `t${Date.now()}`
+  }
+}
 
 type SearchClusterProps = {
   compact?: boolean
@@ -569,6 +587,7 @@ function SearchHome() {
         platforms: platformsParam,
         condition: conditionFilter,
         sort: sortKey,
+        session_id: getOrCreateSearchSessionId(),
       })
       const res = await fetch(`/api/search?${qs.toString()}`)
       if (!res.ok) {

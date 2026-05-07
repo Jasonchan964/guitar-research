@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import json
 import logging
 import os
 import re
+import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -1805,6 +1809,114 @@ def _dedupe_results_preserve_order(rows: list[dict[str, Any]]) -> list[dict[str,
     return out
 
 
+REVERB_CROSS_PAGE_SESSION_TTL_SEC = 3600.0
+REVERB_CROSS_PAGE_SESSION_MAX_KEYS = 8192
+_REVERB_CROSS_PAGE_LOCK = threading.Lock()
+# ``cache_key -> (last_touch_monotonic, set[normalized_reverb_product_url])``
+_REVERB_CROSS_PAGE_SEEN: dict[str, tuple[float, set[str]]] = {}
+
+
+def _reverb_cross_page_scope_signature(
+    q_clean: str,
+    sort_norm: str,
+    cond_norm: str,
+    selected: frozenset[str],
+) -> str:
+    """同一会话下按搜索条件隔离已返回的 Reverb 商品 URL。"""
+    blob = json.dumps(
+        {
+            "q": q_clean.casefold(),
+            "sort": sort_norm,
+            "cond": cond_norm,
+            "platforms": sorted(selected),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode()).hexdigest()[:24]
+
+
+def _normalize_cross_page_session_id(raw: str | None) -> str:
+    s = (raw or "").strip()
+    if not s or len(s) > 128:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9._~-]+", s):
+        return ""
+    return s
+
+
+def _prune_reverb_cross_page_sessions_unlocked(now: float) -> None:
+    global _REVERB_CROSS_PAGE_SEEN
+    if len(_REVERB_CROSS_PAGE_SEEN) > REVERB_CROSS_PAGE_SESSION_MAX_KEYS:
+        drop_n = len(_REVERB_CROSS_PAGE_SEEN) - REVERB_CROSS_PAGE_SESSION_MAX_KEYS // 2
+        for key, _ in sorted(
+            _REVERB_CROSS_PAGE_SEEN.items(),
+            key=lambda kv: kv[1][0],
+        )[: max(0, drop_n)]:
+            _REVERB_CROSS_PAGE_SEEN.pop(key, None)
+    expired = [
+        k
+        for k, (ts, _) in _REVERB_CROSS_PAGE_SEEN.items()
+        if now - ts > REVERB_CROSS_PAGE_SESSION_TTL_SEC
+    ]
+    for k in expired:
+        _REVERB_CROSS_PAGE_SEEN.pop(k, None)
+
+
+def _apply_reverb_cross_page_session_filter(
+    rows: list[dict[str, Any]],
+    *,
+    session_id: str | None,
+    scope_sig: str | None,
+    treats_all_as_reverb: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    同一 ``session_id`` + 同一搜索快照（``scope_sig``）下：跨请求过滤已在前面页下发过的 **Reverb** 行，
+    减少翻页/API 漂移导致的重复。（依赖规范化商品 URL；未传 ``session_id`` 时不做任何事。）
+
+    ``treats_all_as_reverb``：``GET /search`` 的扁平条目无 ``source`` 字段时为真。
+    """
+    sid = _normalize_cross_page_session_id(session_id)
+    if not sid or not scope_sig:
+        return rows
+    canonical = f"{sid}::{scope_sig}"
+    out: list[dict[str, Any]] = []
+
+    now = time.monotonic()
+    with _REVERB_CROSS_PAGE_LOCK:
+        _prune_reverb_cross_page_sessions_unlocked(now)
+        ent = _REVERB_CROSS_PAGE_SEEN.get(canonical)
+        seen: set[str] = ent[1].copy() if ent else set()
+
+        for r in rows:
+            src = str(r.get("source") or "").strip()
+            is_rev = src == "Reverb" or (
+                treats_all_as_reverb and not src and str(r.get("url") or "").strip()
+            )
+            if not is_rev:
+                out.append(r)
+                continue
+            uk = _normalize_url_for_dedup(str(r.get("url") or ""))
+            if uk and uk in seen:
+                continue
+            out.append(r)
+
+        for r in out:
+            src = str(r.get("source") or "").strip()
+            is_rev = src == "Reverb" or (
+                treats_all_as_reverb and not src and str(r.get("url") or "").strip()
+            )
+            if not is_rev:
+                continue
+            uk = _normalize_url_for_dedup(str(r.get("url") or ""))
+            if uk:
+                seen.add(uk)
+
+        _REVERB_CROSS_PAGE_SEEN[canonical] = (now, seen)
+
+    return out
+
+
 def _normalize_platform_slug_token(token: str) -> str | None:
     """
     将 ``platforms`` 查询串中的片段规范为 ``ALL_PLATFORM_SLUGS`` 之一；无法识别则 ``None``。
@@ -1989,6 +2101,11 @@ async def search_reverb(
         "relevance",
         description="排序：``relevance`` | ``price_desc`` | ``price_asc``（传入 Reverb ``order``）",
     ),
+    session_id: str = Query(
+        "",
+        description="可选。与 ``/api/search`` 相同语义：跨页时在进程内跳过已下发的 Reverb 商品（URL）。",
+        max_length=128,
+    ),
 ) -> dict[str, Any]:
     """
     调用 Reverb ``GET https://api.reverb.com/api/listings``，返回标题、图片、价格、原页链接。
@@ -2016,6 +2133,15 @@ async def search_reverb(
     )
 
     results = [listing_to_search_item(item) for item in raw]
+    scope_sig = _reverb_cross_page_scope_signature(
+        q.strip(), sort_norm, "all", frozenset(("reverb",))
+    )
+    results = _apply_reverb_cross_page_session_filter(
+        results,
+        session_id=session_id,
+        scope_sig=scope_sig,
+        treats_all_as_reverb=True,
+    )
     return {"query": q.strip(), "sort": sort_norm, "results": results}
 
 
@@ -2406,6 +2532,14 @@ async def api_search(
             "多站合并时在服务端做全局排序与分页"
         ),
     ),
+    session_id: str = Query(
+        "",
+        description=(
+            "可选。前端 Tab 会话 ID（字母数字 ``.-_~``，≤128）；"
+            "与关键词/平台/成色/排序一起构成作用域：翻页时在进程内跳过已返回过的 **Reverb** 商品。"
+        ),
+        max_length=128,
+    ),
 ) -> dict[str, Any]:
     """
     按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
@@ -2415,6 +2549,8 @@ async def api_search(
     合并后仍按 ``condition`` 做一次全局成色过滤。
 
     合并结果按规范化 ``url`` 去重（仅本次响应内）后，再按 ``condition`` 做二次过滤。
+    Reverb：API 返回的单页列表在 ``reverb_client`` 内按稳定 listing 主键去重；若传 ``session_id``，
+    同一搜索快照下跨页会跳过已下发过的 Reverb 商品（规范化 URL，进程内 TTL 缓存）。
 
     当 ``page>1`` 且过滤后结果为空时，自动向后最多尝试 ``API_SEARCH_EMPTY_PAGE_MAX_SKIP`` 页，
     返回首个非空页；此时响应含 ``requested_page`` 与 ``page_adjusted``。
@@ -2444,17 +2580,29 @@ async def api_search(
         )
     cond_norm = normalize_condition_param(condition)
 
+    sid_norm = _normalize_cross_page_session_id(session_id)
+    scope_sig = _reverb_cross_page_scope_signature(
+        q_clean, sort_norm, cond_norm, frozenset(selected)
+    )
+
     logger.info(
-        "[api/search] start query=%r page=%s platforms=%s condition=%s sort=%s",
+        "[api/search] start query=%r page=%s platforms=%s condition=%s sort=%s sid=%s",
         q_clean,
         page_no,
         sorted(selected),
         cond_norm,
         sort_norm,
+        bool(sid_norm),
     )
 
     results, has_more = await _run_global_search(
         q_clean, page_no, selected, cond_norm, sort_norm
+    )
+    results = _apply_reverb_cross_page_session_filter(
+        results,
+        session_id=sid_norm or None,
+        scope_sig=scope_sig,
+        treats_all_as_reverb=False,
     )
     effective_page = page_no
     page_adjusted = False
@@ -2464,6 +2612,12 @@ async def api_search(
             fp = page_no + step
             results, has_more = await _run_global_search(
                 q_clean, fp, selected, cond_norm, sort_norm
+            )
+            results = _apply_reverb_cross_page_session_filter(
+                results,
+                session_id=sid_norm or None,
+                scope_sig=scope_sig,
+                treats_all_as_reverb=False,
             )
             if len(results) > 0:
                 effective_page = fp

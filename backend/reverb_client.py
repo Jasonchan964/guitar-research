@@ -6,6 +6,8 @@ Reverb API 客户端（Personal Access Token）。
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 from urllib.parse import quote
 
@@ -37,6 +39,72 @@ def _abs_href(href: str) -> str:
     if href.startswith("/"):
         return f"{REVERB_WEB_ORIGIN}{href}"
     return href
+
+
+def reverb_listing_stable_id(listing: dict[str, Any]) -> str:
+    """
+    Reverb HAL listing 的稳定主键（单页内/API 批次去重用）。
+
+    优先 ``id`` / ``listing_id`` / ``uuid``，其次 ``slug``，再从 ``_links.self`` 取路径末段，
+    最后用语义字段做稳定哈希兜底。
+    """
+    if not isinstance(listing, dict):
+        return "invalid"
+
+    lid: Any = listing.get("listing_id") if listing.get("listing_id") is not None else listing.get("id")
+    if lid is not None:
+        s = str(lid).strip()
+        if s:
+            return f"id:{s}"
+
+    uuid = listing.get("uuid")
+    if uuid is not None:
+        su = str(uuid).strip()
+        if su:
+            return f"uuid:{su}"
+
+    slug = listing.get("slug")
+    if isinstance(slug, str):
+        cs = slug.strip()
+        if cs:
+            return f"slug:{cs.lower()}"
+
+    links = listing.get("_links") or {}
+    self_link = links.get("self") if isinstance(links, dict) else None
+    if isinstance(self_link, dict):
+        href = (self_link.get("href") or "").strip()
+        if href:
+            seg = href.split("?", 1)[0].rstrip("/").split("/")[-1]
+            if seg:
+                return f"self:{seg}"
+
+    title = listing.get("title") or listing.get("name") or ""
+    web = extract_listing_web_url(listing)
+    price_blob = listing.get("price") if isinstance(listing.get("price"), dict) else {}
+    fingerprint = json.dumps(
+        {"t": title, "u": web, "amount": price_blob.get("amount") if isinstance(price_blob, dict) else ""},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return "h:" + hashlib.sha256(fingerprint.encode()).hexdigest()[:32]
+
+
+def dedupe_reverb_listings_preserve_order(listings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Reverb API 偶有重复 listing：**首次出现顺序**保持不变，后出现的同 id/slug 丢弃。
+    （不用 ``{id: item}.values()`` 以免打乱重复项之间的相对顺序语义。）
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in listings:
+        if not isinstance(item, dict):
+            continue
+        k = reverb_listing_stable_id(item)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(item)
+    return out
 
 
 def extract_listing_web_url(listing: dict[str, Any]) -> str:
@@ -271,7 +339,8 @@ def search_reverb_listings_sync(
         print(f"💥 [Reverb 异常] 请求发生错误: {e}", flush=True)
         return []
 
-    return _extract_listings_from_reverb_payload(data)
+    extracted = _extract_listings_from_reverb_payload(data)
+    return dedupe_reverb_listings_preserve_order(extracted)
 
 
 async def search_reverb_listings_async(
@@ -320,7 +389,8 @@ async def search_reverb_listings_async(
         print(f"💥 [Reverb 异常] 请求发生错误: {e}", flush=True)
         return []
 
-    return _extract_listings_from_reverb_payload(data)
+    extracted = _extract_listings_from_reverb_payload(data)
+    return dedupe_reverb_listings_preserve_order(extracted)
 
 
 def _extract_listings_from_reverb_payload(data: Any) -> list[dict[str, Any]]:
