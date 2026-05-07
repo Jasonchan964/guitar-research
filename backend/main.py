@@ -229,19 +229,21 @@ def _digimart_abs_url(href_or_src: str) -> str:
     return f"{DIGIMART_ORIGIN}/{s}"
 
 
-def get_hd_image_url(url: str) -> str:
+def get_digimart_hd_image(url: str) -> str:
     """
-    Digimart 等站点缩略图 URL（``_s`` / ``_thumb`` 等）还原为更接近原图的地址。
-    去掉查询串里的缩放参数，并把文件名中的缩略后缀替换为扩展名直连。
+    Digimart 图片 URL：去掉查询参数，将缩略/中图后缀精准替换为 ``_l.`` 大图。
+    （``_s`` 极小模糊、``_m`` 略模糊 → ``_l`` 琴行上传原图尺寸；可选 ``_g`` 超清另议。）
     """
     if not url:
         return ""
-    u = url.split("?")[0]
-    for suffix in ("_s.", "_m.", "_thumb.", "_thumbnail."):
-        if suffix in u:
-            u = u.replace(suffix, ".")
-            break
-    return u
+    url = url.split("?")[0]
+    if "_s." in url:
+        url = url.replace("_s.", "_l.")
+    elif "_m." in url:
+        url = url.replace("_m.", "_l.")
+    elif "_thumb." in url:
+        url = url.replace("_thumb.", "_l.")
+    return url
 
 
 def _parse_jpy_amount(text: str) -> int | None:
@@ -420,7 +422,7 @@ def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
     src = (img.get("src") or "").strip() if img is not None else ""
     image: str | None = None
     if src:
-        image = get_hd_image_url(_digimart_abs_url(src)) or None
+        image = get_digimart_hd_image(_digimart_abs_url(src)) or None
 
     jpy: int | None = None
     state = block.select_one(".itemState")

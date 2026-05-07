@@ -345,6 +345,37 @@ def _digimart_abs(href: str) -> str:
     return f"{DIGIMART_ORIGIN}/{s}"
 
 
+def _digimart_href_is_direct_image(href: str) -> bool:
+    """``href`` 去掉 query 后是否为常见图片扩展名（副图区常用 ``<a href=\"大图\"><img/></a>``）。"""
+    path = (href or "").strip().split("?")[0].lower()
+    return path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+
+
+def _digimart_raw_image_url_from_img(img: Tag) -> str:
+    """
+    单张 ``<img>`` 的最佳图源：
+    1. 父级 ``<a href>`` 若指向图片 URL，优先；
+    2. ``data-large-src`` / ``data-full-src`` / ``data-src`` 等；
+    3. 最后 ``src``。
+    """
+    parent_a = img.find_parent("a")
+    if parent_a is not None:
+        href = (parent_a.get("href") or "").strip()
+        if href and _digimart_href_is_direct_image(href):
+            return href
+    for attr in (
+        "data-large-src",
+        "data-full-src",
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+    ):
+        v = (img.get(attr) or "").strip()
+        if v:
+            return v
+    return (img.get("src") or "").strip()
+
+
 def _parse_jpy_int(text: str) -> int | None:
     import main as app_main
 
@@ -359,6 +390,12 @@ def _digimart_collect_images(soup: BeautifulSoup) -> list[str]:
         ".itemMainPhoto img",
         "div[class*='itemPhoto'] img",
         "div[class*='PhotoArea'] img",
+        ".item-sub-images img",
+        ".itemSubImages img",
+        "[class*='item-sub-image'] img",
+        "[class*='sub-images'] img",
+        ".thumb-list img",
+        ".thumbList img",
         "ul.thumbList img",
         "ul[class*='thumb'] img",
         ".itemImage img",
@@ -373,14 +410,10 @@ def _digimart_collect_images(soup: BeautifulSoup) -> list[str]:
             for img in base.select(sel):
                 if _digimart_is_excluded_chrome(img):
                     continue
-                raw = (
-                    (img.get("data-src") or "").strip()
-                    or (img.get("data-original") or "").strip()
-                    or (img.get("src") or "").strip()
-                )
+                raw = _digimart_raw_image_url_from_img(img)
                 if not raw or "spacer" in raw.casefold() or "blank" in raw.casefold():
                     continue
-                u = app_main.get_hd_image_url(_digimart_abs(raw))
+                u = app_main.get_digimart_hd_image(_digimart_abs(raw))
                 if u and "logo" not in u.casefold() and "icon" not in u.casefold():
                     if u not in seen_sel:
                         seen_sel.add(u)
@@ -396,7 +429,7 @@ def _digimart_collect_images(soup: BeautifulSoup) -> list[str]:
 
         og = soup.select_one('meta[property="og:image"]')
         if og and og.get("content"):
-            u = app_main.get_hd_image_url(_digimart_abs(str(og["content"]).strip()))
+            u = app_main.get_digimart_hd_image(_digimart_abs(str(og["content"]).strip()))
             if u:
                 urls.append(u)
     return urls
