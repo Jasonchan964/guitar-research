@@ -1601,10 +1601,11 @@ def _reverb_api_token() -> str:
 
 
 def _reverb_official_request_headers(token: str) -> dict[str, str]:
-    """与 Reverb 官方要求一致：Bearer、``application/vnd.reverb.v2+json``、JSON Content-Type。"""
+    """与 Reverb 官方要求一致：Bearer、v2 Accept、``Accept-Version``、JSON Content-Type。"""
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.reverb.v2+json",
+        "Accept-Version": "3.0",
         "Content-Type": "application/json",
     }
 

@@ -21,10 +21,11 @@ REVERB_HTTP_TIMEOUT_SEC = 10.0
 
 
 def reverb_request_headers(access_token: str) -> dict[str, str]:
-    """官方 PAT 请求头：Bearer + v2 Accept（勿与浏览器 UA / hal+json 混用导致行为异常）。"""
+    """官方 PAT 请求头：Bearer + v2 Accept + Accept-Version（API 要求，缺省会 400）。"""
     return {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/vnd.reverb.v2+json",
+        "Accept-Version": "3.0",
         "Content-Type": "application/json",
     }
 
