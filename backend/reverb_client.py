@@ -7,6 +7,7 @@ Reverb API 客户端（Personal Access Token）。
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -58,6 +59,83 @@ def extract_listing_web_url(listing: dict[str, Any]) -> str:
         if href:
             return _abs_href(href)
     return ""
+
+
+def hal_listing_price_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
+    """单条 listing HAL 对象的标价 ``price`` / 别名 → 金额与 ISO 货币。"""
+    price_obj: Any = listing.get("price")
+    if not isinstance(price_obj, dict):
+        for alt in ("offer_price", "asking_price", "display_price"):
+            cand = listing.get(alt)
+            if isinstance(cand, dict) and cand.get("amount") is not None:
+                price_obj = cand
+                break
+        else:
+            return None, None
+    raw_amt = price_obj.get("amount")
+    if raw_amt is None:
+        return None, None
+    try:
+        amt = float(str(raw_amt).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None, None
+    if amt <= 0:
+        return None, None
+    cur = (
+        price_obj.get("currency")
+        or price_obj.get("currency_iso")
+        or price_obj.get("currencyCode")
+        or ""
+    )
+    c = str(cur).strip().upper()
+    return amt, c if c else None
+
+
+def extract_all_listing_photo_urls(listing: dict[str, Any]) -> list[str]:
+    """
+    从 ``photos`` 收集全部展示用 URL，优先 ``original``、``_links.large`` / ``large_crop`` / ``full`` 等高清链接。
+    """
+    photos = listing.get("photos")
+    if not isinstance(photos, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in photos:
+        u = ""
+        if isinstance(p, str):
+            u = p.strip()
+        elif isinstance(p, dict):
+            orig = p.get("original")
+            if orig is not None:
+                u = str(orig).strip()
+            if not u:
+                plinks = p.get("_links") or {}
+                if isinstance(plinks, dict):
+                    for key in ("large", "large_crop", "full", "medium_crop", "thumbnail", "small_crop"):
+                        block = plinks.get(key)
+                        if isinstance(block, dict):
+                            href = (block.get("href") or "").strip()
+                            if href:
+                                u = href
+                                break
+            if not u and p.get("url"):
+                u = str(p["url"]).strip()
+        if not u:
+            continue
+        abs_u = u if u.startswith("http") else _abs_href(u)
+        if abs_u and abs_u not in seen:
+            seen.add(abs_u)
+            out.append(abs_u)
+    return out
+
+
+def reverb_single_listing_api_url(id_or_slug: str) -> str:
+    """``GET https://api.reverb.com/api/listings/{id_or_slug}`` 完整 URL（路径段已编码）。"""
+    k = (id_or_slug or "").strip()
+    if not k:
+        return ""
+    seg = quote(k, safe="-_.~")
+    return f"{REVERB_API_ROOT}/api/listings/{seg}"
 
 
 def extract_first_photo_url(listing: dict[str, Any]) -> str | None:

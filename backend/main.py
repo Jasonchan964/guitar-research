@@ -50,6 +50,7 @@ from reverb_client import (
     REVERB_LISTINGS_PER_PAGE_DEFAULT,
     extract_first_photo_url,
     extract_listing_web_url,
+    hal_listing_price_amount_currency as _reverb_amount_currency,
     listing_to_search_item,
     search_reverb_listings_async,
 )
@@ -228,6 +229,21 @@ def _digimart_abs_url(href_or_src: str) -> str:
     return f"{DIGIMART_ORIGIN}/{s}"
 
 
+def get_hd_image_url(url: str) -> str:
+    """
+    Digimart 等站点缩略图 URL（``_s`` / ``_thumb`` 等）还原为更接近原图的地址。
+    去掉查询串里的缩放参数，并把文件名中的缩略后缀替换为扩展名直连。
+    """
+    if not url:
+        return ""
+    u = url.split("?")[0]
+    for suffix in ("_s.", "_m.", "_thumb.", "_thumbnail."):
+        if suffix in u:
+            u = u.replace(suffix, ".")
+            break
+    return u
+
+
 def _parse_jpy_amount(text: str) -> int | None:
     """
     解析日元标价。不得使用「全文去非数字」：列表卡片上常见 ``2026/05/07`` 等日期，
@@ -402,7 +418,9 @@ def _digimart_block_to_raw(block: Any) -> dict[str, Any] | None:
 
     img = block.select_one(".pic img")
     src = (img.get("src") or "").strip() if img is not None else ""
-    image: str | None = _digimart_abs_url(src) if src else None
+    image: str | None = None
+    if src:
+        image = get_hd_image_url(_digimart_abs_url(src)) or None
 
     jpy: int | None = None
     state = block.select_one(".itemState")
@@ -1563,36 +1581,6 @@ async def _safe_scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, An
     except Exception as e:
         logger.error("[Swee Lee] _safe_scrape_sweelee unexpected: %s", e, exc_info=True)
         return []
-
-
-def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
-    """Reverb HAL listing 的 ``price``（及常见别名）→ 金额与 ISO 货币。"""
-    price_obj: Any = listing.get("price")
-    if not isinstance(price_obj, dict):
-        for alt in ("offer_price", "asking_price", "display_price"):
-            cand = listing.get(alt)
-            if isinstance(cand, dict) and cand.get("amount") is not None:
-                price_obj = cand
-                break
-        else:
-            return None, None
-    raw_amt = price_obj.get("amount")
-    if raw_amt is None:
-        return None, None
-    try:
-        amt = float(str(raw_amt).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return None, None
-    if amt <= 0:
-        return None, None
-    cur = (
-        price_obj.get("currency")
-        or price_obj.get("currency_iso")
-        or price_obj.get("currencyCode")
-        or ""
-    )
-    c = str(cur).strip().upper()
-    return amt, c if c else None
 
 
 def _reverb_api_token() -> str:

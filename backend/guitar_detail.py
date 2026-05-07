@@ -1,6 +1,8 @@
 """
 站内商品详情：按平台深度抓取单页，供 ``GET /api/guitar/detail`` 使用。
 
+Reverb：使用官方 ``GET /api/listings/{id_or_slug}``（``REVERB_API_TOKEN``），不抓取前台 HTML，避免 Cloudflare 403。
+
 仅允许已知电商域名，避免 SSRF。
 """
 
@@ -8,12 +10,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import httpx
+from reverb_client import (
+    extract_all_listing_photo_urls,
+    extract_listing_web_url,
+    hal_listing_price_amount_currency,
+    reverb_request_headers,
+    reverb_single_listing_api_url,
+)
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from fastapi import HTTPException
@@ -50,18 +60,6 @@ DIGIMART_BROWSER_HEADERS = {
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     "Cache-Control": "no-cache",
     "Upgrade-Insecure-Requests": "1",
-}
-
-REVERB_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
 GUITARGUITAR_BROWSER_HEADERS = {
@@ -367,6 +365,8 @@ def _digimart_collect_images(soup: BeautifulSoup) -> list[str]:
     )
 
     def collect_from(base: BeautifulSoup | Tag) -> list[str]:
+        import main as app_main
+
         out: list[str] = []
         seen_sel: set[str] = set()
         for sel in selectors:
@@ -380,7 +380,7 @@ def _digimart_collect_images(soup: BeautifulSoup) -> list[str]:
                 )
                 if not raw or "spacer" in raw.casefold() or "blank" in raw.casefold():
                     continue
-                u = _digimart_abs(raw)
+                u = app_main.get_hd_image_url(_digimart_abs(raw))
                 if u and "logo" not in u.casefold() and "icon" not in u.casefold():
                     if u not in seen_sel:
                         seen_sel.add(u)
@@ -392,9 +392,11 @@ def _digimart_collect_images(soup: BeautifulSoup) -> list[str]:
     if not urls:
         urls = collect_from(soup)
     if not urls:
+        import main as app_main
+
         og = soup.select_one('meta[property="og:image"]')
         if og and og.get("content"):
-            u = _digimart_abs(str(og["content"]).strip())
+            u = app_main.get_hd_image_url(_digimart_abs(str(og["content"]).strip()))
             if u:
                 urls.append(u)
     return urls
@@ -567,32 +569,6 @@ def _html_meta_og_image(soup: BeautifulSoup) -> str | None:
     if og and og.get("content"):
         return str(og["content"]).strip()
     return None
-
-
-def _reverb_gallery_from_html(soup: BeautifulSoup) -> list[str]:
-    urls: list[str] = []
-    for img in soup.select(
-        "[data-gallery] img, .listing-gallery img, [class*='listing-gallery'] img, "
-        ".react-images__image img, picture source[srcset]"
-    ):
-        raw = (img.get("src") or "").strip()
-        if not raw:
-            srcset = img.get("srcset") if img.name == "source" else None
-            if srcset:
-                raw = srcset.split(",")[0].strip().split()[0]
-        if raw and raw.startswith("http"):
-            urls.append(raw)
-    if not urls:
-        u = _html_meta_og_image(soup)
-        if u:
-            urls.append(u)
-    seen: set[str] = set()
-    out: list[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
 
 
 def _description_from_ld_or_meta(soup: BeautifulSoup, ld: dict[str, Any] | None) -> str:
@@ -782,22 +758,108 @@ async def _fetch_digimart_detail(client: httpx.AsyncClient, page_url: str) -> di
     }
 
 
+def _parse_reverb_listing_key_from_url(page_url: str) -> str | None:
+    """从 ``…/item/{id-or-slug}`` 或 ``…/listings/show/{id}`` 解析官方详情 API 路径参数。"""
+    try:
+        p = urlparse(page_url.strip())
+    except Exception:
+        return None
+    path = p.path or ""
+    m = re.search(r"/item/([^/?#]+)", path)
+    if m:
+        k = m.group(1).strip()
+        return k or None
+    m = re.search(r"/listings/show/([^/?#]+)", path)
+    if m:
+        k = m.group(1).strip()
+        return k or None
+    return None
+
+
+def _reverb_api_specs_to_plain_dict(raw: Any) -> dict[str, str]:
+    """详情 JSON ``specs`` → 扁平 ``dict[str, str]``。"""
+    out: dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        ks = str(k).strip()
+        if not ks:
+            continue
+        if isinstance(v, (dict, list)):
+            try:
+                out[ks] = json.dumps(v, ensure_ascii=False)
+            except TypeError:
+                out[ks] = str(v)
+        else:
+            out[ks] = str(v).strip()
+    return out
+
+
+def _reverb_api_description_html(desc_raw: Any) -> str:
+    if desc_raw is None:
+        return ""
+    s = desc_raw if isinstance(desc_raw, str) else str(desc_raw)
+    s = s.strip()
+    if not s:
+        return ""
+    if "<" in s and ">" in s:
+        return f'<div class="reverb-api-desc">{s}</div>'
+    return f'<div class="reverb-api-desc"><p>{_html_escape(s)}</p></div>'
+
+
 async def _fetch_reverb_detail(client: httpx.AsyncClient, page_url: str) -> dict[str, Any]:
-    r = await client.get(page_url.strip(), headers=REVERB_BROWSER_HEADERS, follow_redirects=True)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    ld = _collect_json_ld_product(soup)
-    title = ""
-    if ld and isinstance(ld.get("name"), str):
-        title = ld["name"].strip()
-    if not title:
-        og = soup.select_one('meta[property="og:title"]')
-        if og and og.get("content"):
-            title = str(og["content"]).split("|")[0].strip()
-    images = _ld_product_images(ld) if ld else []
-    if not images:
-        images = _reverb_gallery_from_html(soup)
-    amt, cur = _ld_product_price_currency(ld) if ld else (None, None)
+    """
+    Reverb：仅调用 ``GET /api/listings/{id_or_slug}``，不使用浏览器 HTML（避免 Cloudflare 403）。
+    """
+    import main as app_main
+
+    token = (os.environ.get("REVERB_API_TOKEN") or "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="未配置 REVERB_API_TOKEN，无法通过官方 API 获取 Reverb 详情",
+        )
+
+    key = _parse_reverb_listing_key_from_url(page_url)
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="无法从 URL 解析 Reverb 商品 id/slug（需为 …/item/{标识} 等形式）",
+        )
+
+    api_url = reverb_single_listing_api_url(key)
+    if not api_url:
+        raise HTTPException(status_code=400, detail="无效的 Reverb 商品标识")
+
+    headers = reverb_request_headers(token)
+    r = await client.get(api_url, headers=headers)
+    if r.status_code != 200:
+        snippet = (r.text or "")[:1500]
+        logger.warning(
+            "Reverb listing detail API: status=%s url=%s body=%s",
+            r.status_code,
+            api_url,
+            snippet[:800],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Reverb 详情 API 返回 {r.status_code}: {snippet[:600]}",
+        )
+
+    try:
+        listing = r.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Reverb 详情 API 非合法 JSON: {e}") from e
+
+    if not isinstance(listing, dict):
+        raise HTTPException(status_code=502, detail="Reverb 详情 API 返回格式异常")
+
+    title = str(listing.get("title") or listing.get("name") or "").strip()
+    images = extract_all_listing_photo_urls(listing)
+    description_html = _reverb_api_description_html(listing.get("description", ""))
+    specs = _reverb_api_specs_to_plain_dict(listing.get("specs"))
+
+    amt, cur = hal_listing_price_amount_currency(listing)
     if amt is None:
         price_cny = None
         price_original = ""
@@ -805,11 +867,10 @@ async def _fetch_reverb_detail(client: httpx.AsyncClient, page_url: str) -> dict
         c = cur or "USD"
         price_original = _format_price_original(amt, c)
         price_cny = await _amount_to_cny(client, amt, c)
-    desc_html = _description_from_ld_or_meta(soup, ld)
-    specs = _reverb_specs_from_ld(ld)
-    cond = _condition_from_description_text(
-        (ld.get("description") if ld else "") or desc_html or title,
-    )
+
+    cond = app_main._reverb_condition_cn(listing)
+    buy = extract_listing_web_url(listing).strip() or page_url.strip()
+
     return {
         "title": title or "商品",
         "price_cny": round(price_cny, 2) if price_cny is not None else None,
@@ -818,8 +879,8 @@ async def _fetch_reverb_detail(client: httpx.AsyncClient, page_url: str) -> dict
         "condition": cond,
         "images": images,
         "specs": specs,
-        "description_html": desc_html,
-        "buy_url": page_url.strip(),
+        "description_html": description_html,
+        "buy_url": buy,
     }
 
 
