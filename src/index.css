@@ -1,4 +1,25 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@keyframes detail-cta-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      0 4px 14px -3px rgb(0 0 0 / 0.12),
+      0 0 0 0 rgb(59 130 246 / 0.22);
+  }
+  50% {
+    transform: scale(1.015);
+    box-shadow:
+      0 8px 24px -4px rgb(59 130 246 / 0.28),
+      0 0 0 6px rgb(59 130 246 / 0);
+  }
+}
+
+.animate-detail-cta-breathe {
+  animation: detail-cta-breathe 2.4s ease-in-out infinite;
+}
 
 body {
   margin: 0;

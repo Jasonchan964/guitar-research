@@ -4,7 +4,7 @@
 汇率来源：Frankfurter（欧洲央行参考汇率，免费、无需 API Key）
 文档：https://www.frankfurter.app/docs/
 
-另：`GET /search` 使用 Reverb API（需环境变量 REVERB_TOKEN）。
+另：`GET /search` 使用 Reverb API（环境变量 ``REVERB_API_TOKEN`` 优先，其次 ``REVERB_TOKEN``）。
 `GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition（USD/JPY/GBP→CNY 汇率来自 Frankfurter；GBP 缺失时可回落 ``GBP_CNY_RATE``）。
 """
@@ -31,6 +31,7 @@ from env_load import load_project_dotenv
 load_project_dotenv()
 
 from exchange_rate_cache import get_usd_cny_rate_cached
+from guitar_detail import fetch_guitar_detail
 
 if not logging.root.handlers:
     logging.basicConfig(
@@ -219,14 +220,42 @@ def _digimart_abs_url(href_or_src: str) -> str:
 
 
 def _parse_jpy_amount(text: str) -> int | None:
-    digits = re.sub(r"\D", "", text)
-    if not digits:
+    """
+    解析日元标价。不得使用「全文去非数字」：列表卡片上常见 ``2026/05/07`` 等日期，
+    会与 ``¥198,000`` 拼成二十余位错误整数。
+    """
+    if not text or not str(text).strip():
+        return None
+    blob = str(text)
+    # 显式 ¥ / ￥ 后金额（含千分位或无逗号）；同一区块多条时取**最后一条**（常为现价/税込价）
+    yen_vals: list[int] = []
+    for m in re.finditer(r"[¥￥]\s*([\d]{1,3}(?:,\d{3})+|[\d]{2,9})(?!\d)", blob):
+        raw = m.group(1).replace(",", "")
+        if raw.isdigit():
+            n = int(raw)
+            if 100 <= n <= 500_000_000:
+                yen_vals.append(n)
+    if yen_vals:
+        return yen_vals[-1]
+    # 「123,456 円」
+    en_vals: list[int] = []
+    for m in re.finditer(r"([\d]{1,3}(?:,\d{3})+|[\d]{2,9})\s*円", blob):
+        raw = m.group(1).replace(",", "")
+        if raw.isdigit():
+            n = int(raw)
+            if 100 <= n <= 500_000_000:
+                en_vals.append(n)
+    if en_vals:
+        return en_vals[-1]
+    # 保守回退：仅当去标点后的数字段足够短（避免吞日期+价格）
+    digits = re.sub(r"\D", "", blob)
+    if not digits or len(digits) > 9:
         return None
     try:
         n = int(digits)
     except ValueError:
         return None
-    return n if n > 0 else None
+    return n if 100 <= n <= 500_000_000 else None
 
 
 def _blob_indicates_new_condition(blob: str) -> bool:
@@ -921,6 +950,47 @@ def _ishibashi_parse_price_raw_from_product(prod: dict[str, Any]) -> float | Non
         return None
 
 
+def _shopify_extract_all_image_urls(
+    prod: dict[str, Any],
+    upgrade_url: Any,
+) -> list[str]:
+    """
+    从 Shopify 风格 ``products`` JSON 的 ``images`` 数组提取全部图片 URL；
+    ``upgrade_url`` 为接受原始 ``src`` 并返回展示用 URL 的单参函数。
+    """
+    out: list[str] = []
+    images = prod.get("images")
+    if isinstance(images, list):
+        for im in images:
+            u = ""
+            if isinstance(im, dict):
+                u = (im.get("src") or im.get("url") or "").strip()
+            elif isinstance(im, str):
+                u = im.strip()
+            if u:
+                try:
+                    out.append(str(upgrade_url(u)))
+                except Exception:
+                    out.append(u)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in out:
+        if s and s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    return deduped
+
+
+def _shopify_body_html(prod: dict[str, Any]) -> str:
+    """``body_html`` 原样透出给前端富文本展示；缺失或非字符串时为空串。"""
+    raw = prod.get("body_html")
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    return str(raw)
+
+
 def _ishibashi_extract_image_url(prod: dict[str, Any]) -> str:
     fi = prod.get("featured_image")
     if isinstance(fi, dict):
@@ -958,6 +1028,10 @@ def _ishibashi_product_to_raw(
     if not oc:
         oc = "JPY"
     condition = _ishibashi_condition_from_product(prod)
+    all_images = _shopify_extract_all_image_urls(prod, _ishibashi_upgrade_image_url)
+    if not all_images and image_url:
+        all_images = [image_url]
+    description = _shopify_body_html(prod)
     return {
         "title": title,
         "image": image_url or None,
@@ -965,6 +1039,8 @@ def _ishibashi_product_to_raw(
         "original_currency": oc,
         "url": url,
         "condition": condition,
+        "all_images": all_images,
+        "description": description,
     }
 
 
@@ -1111,6 +1187,10 @@ def _sweelee_product_to_raw(
     oc = _ishibashi_extract_currency(prod, root_payload=root_payload)
     if not oc:
         oc = "SGD"
+    all_images = _shopify_extract_all_image_urls(prod, _sweelee_upgrade_image_url)
+    if not all_images and image_url:
+        all_images = [image_url]
+    description = _shopify_body_html(prod)
     return {
         "title": title,
         "image": image_url or None,
@@ -1118,6 +1198,8 @@ def _sweelee_product_to_raw(
         "original_currency": oc,
         "url": url,
         "condition": _sweelee_condition_from_product(prod),
+        "all_images": all_images,
+        "description": description,
     }
 
 
@@ -1475,43 +1557,130 @@ async def _safe_scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, An
 
 
 def _reverb_amount_currency(listing: dict[str, Any]) -> tuple[float | None, str | None]:
-    """Reverb HAL listing 的 ``price`` 对象 → 金额与 ISO 货币。"""
-    price_obj = listing.get("price")
+    """Reverb HAL listing 的 ``price``（及常见别名）→ 金额与 ISO 货币。"""
+    price_obj: Any = listing.get("price")
     if not isinstance(price_obj, dict):
-        return None, None
+        for alt in ("offer_price", "asking_price", "display_price"):
+            cand = listing.get(alt)
+            if isinstance(cand, dict) and cand.get("amount") is not None:
+                price_obj = cand
+                break
+        else:
+            return None, None
     raw_amt = price_obj.get("amount")
     if raw_amt is None:
         return None, None
     try:
-        amt = float(raw_amt)
+        amt = float(str(raw_amt).replace(",", "").strip())
     except (TypeError, ValueError):
         return None, None
-    cur = price_obj.get("currency") or price_obj.get("currency_iso") or ""
+    if amt <= 0:
+        return None, None
+    cur = (
+        price_obj.get("currency")
+        or price_obj.get("currency_iso")
+        or price_obj.get("currencyCode")
+        or ""
+    )
     c = str(cur).strip().upper()
     return amt, c if c else None
 
 
-async def _fetch_reverb_listings(query: str, page: int = 1) -> list[dict[str, Any]]:
-    token = os.environ.get("REVERB_TOKEN", "").strip()
-    if not token:
+def _reverb_api_token() -> str:
+    """个人 PAT：优先 ``REVERB_API_TOKEN``，兼容历史 ``REVERB_TOKEN``。"""
+    for key in ("REVERB_API_TOKEN", "REVERB_TOKEN"):
+        t = (os.environ.get(key) or "").strip()
+        if t:
+            return t
+    return ""
+
+
+async def scrape_reverb(
+    keyword: str,
+    page: int = 1,
+    *,
+    condition: str = "all",
+) -> list[dict[str, Any]]:
+    """
+    通过 Reverb 官方 API（Bearer PAT）拉取列表；非 2xx 时在终端打印状态码与 body 便于排查 401/429。
+
+    - Base URL：``https://api.reverb.com/api/listings``
+    - 翻页：``page``
+    - 成色：``all`` 不传 ``conditions[]``；``new`` → ``conditions[]=new``；``used`` → ``conditions[]=used``
+    """
+    q = keyword.strip()
+    if not q:
+        logger.info("[Reverb] scrape_reverb skipped (empty keyword)")
         return []
+
+    token = _reverb_api_token()
+    if not token:
+        logger.warning(
+            "[Reverb] scrape_reverb skipped: set REVERB_API_TOKEN or REVERB_TOKEN in backend/.env",
+        )
+        return []
+
     pg = max(1, int(page))
-    return await search_reverb_listings_async(
-        token,
-        query,
-        page=pg,
-        per_page=REVERB_PER_PAGE,
-    )
+    cond = normalize_condition_param(condition)
+    logger.info("[Reverb] scrape_reverb start keyword=%r page=%s condition=%s", q, pg, cond)
+
+    try:
+        return await search_reverb_listings_async(
+            token,
+            q,
+            page=pg,
+            per_page=REVERB_PER_PAGE,
+            condition=cond,
+        )
+    except httpx.HTTPStatusError as e:
+        resp = e.response
+        if resp is not None:
+            print(
+                f"Reverb API Error: {resp.status_code}, Response: {resp.text}",
+                flush=True,
+            )
+            logger.error(
+                "[Reverb] HTTPStatusError status=%s url=%s",
+                resp.status_code,
+                resp.url,
+            )
+        else:
+            print(f"Reverb API Error: (no response) {e!s}", flush=True)
+            logger.error("[Reverb] HTTPStatusError without response: %s", e)
+        return []
+    except httpx.HTTPError as e:
+        print(f"Reverb API Error: HTTPError {e!s}", flush=True)
+        logger.error("[Reverb] HTTPError: %s", e, exc_info=True)
+        return []
+    except Exception as e:
+        print(f"Reverb API Error: {type(e).__name__}: {e!s}", flush=True)
+        logger.error("[Reverb] scrape_reverb unexpected: %s", e, exc_info=True)
+        return []
 
 
-async def _safe_fetch_reverb_listings_for_merge(query: str, page: int = 1) -> list[dict[str, Any]]:
+async def _fetch_reverb_listings(
+    query: str,
+    page: int = 1,
+    *,
+    condition: str = "all",
+) -> list[dict[str, Any]]:
+    """内部封装：与 ``scrape_reverb`` 同源，供合并搜索复用。"""
+    return await scrape_reverb(query, page, condition=condition)
+
+
+async def _safe_fetch_reverb_listings_for_merge(
+    query: str,
+    page: int = 1,
+    *,
+    condition: str = "all",
+) -> list[dict[str, Any]]:
     """供 ``/api/search`` 合并结果使用：Reverb 异常时返回空列表，不阻断其他平台。"""
     q = query.strip()
     if not q:
         return []
     pg = max(1, int(page))
     try:
-        return await _fetch_reverb_listings(q, pg)
+        return await _fetch_reverb_listings(q, pg, condition=condition)
     except Exception as e:
         line = (
             f"[Reverb] merge fetch failed | query={q!r} page={pg} | "
@@ -1531,10 +1700,18 @@ def _unified_row(
     price_cny: float | None,
     usd_to_cny: float,
     condition: str,
+    all_images: list[str] | None = None,
+    description: str | None = None,
 ) -> dict[str, Any]:
     price_usd: float | None = None
     if price_cny is not None and usd_to_cny > 0:
         price_usd = round(price_cny / usd_to_cny, 2)
+    imgs: list[str] = []
+    if all_images:
+        imgs = [str(u).strip() for u in all_images if str(u).strip()]
+    if not imgs and image:
+        imgs = [str(image).strip()]
+    desc = (description or "").strip() if description is not None else ""
     return {
         "title": title,
         "image": image,
@@ -1543,6 +1720,8 @@ def _unified_row(
         "source": source,
         "url": url,
         "condition": condition,
+        "all_images": imgs,
+        "description": desc,
     }
 
 
@@ -1650,6 +1829,28 @@ async def exchange_rate() -> dict[str, float]:
     return {"rate": round(rate, 4)}
 
 
+@app.get("/api/guitar/detail")
+async def api_guitar_detail(
+    url: str = Query(
+        ...,
+        min_length=8,
+        description="原站商品详情页完整 URL（http/https）",
+    ),
+    platform: str = Query(
+        ...,
+        min_length=2,
+        description="平台名：Ishibashi / Swee Lee / Digimart / Reverb / GuitarGuitar",
+    ),
+) -> dict[str, Any]:
+    """
+    站内详情页数据：按平台抓取高清图、规格与描述，并换算 ``price_cny``（Frankfurter）。
+
+    返回字段：``title`` / ``price_cny`` / ``price_original`` / ``platform`` / ``condition`` /
+    ``images`` / ``specs`` / ``description_html`` / ``buy_url``。
+    """
+    return await fetch_guitar_detail(url, platform)
+
+
 @app.get("/search")
 async def search_reverb(
     q: str = Query(
@@ -1659,28 +1860,44 @@ async def search_reverb(
     ),
 ) -> dict[str, Any]:
     """
-    调用 Reverb ``/api/listings/all``，返回标题、图片、价格、原页链接。
+    调用 Reverb ``GET https://api.reverb.com/api/listings``，返回标题、图片、价格、原页链接。
 
     前端默认使用 ``GET /api/search``（含 Digimart）；本路由保留给仅需 Reverb 的调用方。
 
-    需在 ``backend/.env`` 中配置 ``REVERB_TOKEN``（Personal Access Token）。
+    需在 ``backend/.env`` 中配置 ``REVERB_API_TOKEN`` 或 ``REVERB_TOKEN``（Personal Access Token）。
     """
-    token = os.environ.get("REVERB_TOKEN", "").strip()
+    token = _reverb_api_token()
     if not token:
         raise HTTPException(
             status_code=503,
-            detail="未配置 REVERB_TOKEN。请在 backend 目录创建 .env 并写入 REVERB_TOKEN=你的令牌",
+            detail=(
+                "未配置 Reverb PAT。请在 backend/.env 中设置 REVERB_API_TOKEN=… "
+                "或 REVERB_TOKEN=…"
+            ),
         )
 
     try:
-        raw = await search_reverb_listings_async(token, q.strip())
+        raw = await search_reverb_listings_async(
+            token,
+            q.strip(),
+            page=1,
+            per_page=REVERB_PER_PAGE,
+            condition="all",
+        )
     except httpx.HTTPStatusError as e:
-        detail = e.response.text[:500] if e.response else str(e)
+        resp = e.response
+        if resp is not None:
+            print(
+                f"Reverb API Error: {resp.status_code}, Response: {resp.text}",
+                flush=True,
+            )
+        detail = resp.text[:500] if resp else str(e)
         raise HTTPException(
             status_code=502,
-            detail=f"Reverb API 返回 {e.response.status_code if e.response else '?'}: {detail}",
+            detail=f"Reverb API 返回 {resp.status_code if resp else '?'}: {detail}",
         ) from e
     except httpx.HTTPError as e:
+        print(f"Reverb API Error: HTTPError {e!s}", flush=True)
         raise HTTPException(status_code=502, detail=f"请求 Reverb 失败: {e}") from e
 
     results = [listing_to_search_item(item) for item in raw]
@@ -1707,7 +1924,9 @@ async def _run_search_single_page(
     labels: list[str] = []
 
     if "reverb" in selected:
-        coros.append(_safe_fetch_reverb_listings_for_merge(q_clean, pg))
+        coros.append(
+            _safe_fetch_reverb_listings_for_merge(q_clean, pg, condition=cond_norm),
+        )
         labels.append("reverb")
     if "digimart" in selected:
         coros.append(scrape_digimart(q_clean, pg, condition=cond_norm))
@@ -1849,11 +2068,12 @@ async def _run_search_single_page(
         url = extract_listing_web_url(listing)
         amt, cur = _reverb_amount_currency(listing)
         price_cny: float | None = None
-        if amt is not None and cur:
-            if cur == "CNY":
+        if amt is not None:
+            iso = (cur or "USD").strip().upper()[:3]
+            if iso == "CNY":
                 price_cny = amt
-            elif cur in rates_map:
-                price_cny = amt * rates_map[cur]
+            elif iso in rates_map:
+                price_cny = amt * rates_map[iso]
         results.append(
             _unified_row(
                 title=title,
@@ -1921,6 +2141,10 @@ async def _run_search_single_page(
                 price_cny=pcny_ib,
                 usd_to_cny=usd_to_cny,
                 condition=ib_cond,
+                all_images=ib.get("all_images")
+                if isinstance(ib.get("all_images"), list)
+                else None,
+                description=str(ib.get("description") or ""),
             )
         )
 
@@ -1943,6 +2167,10 @@ async def _run_search_single_page(
                 price_cny=pcny_sw,
                 usd_to_cny=usd_to_cny,
                 condition=sw_cond,
+                all_images=sw.get("all_images")
+                if isinstance(sw.get("all_images"), list)
+                else None,
+                description=str(sw.get("description") or ""),
             )
         )
 
@@ -2001,6 +2229,7 @@ async def api_search(
     按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
 
     Digimart：``condition=new|used`` 时先在请求上加 ``productTypes``（新品/中古），再解析列表；
+    Reverb：``condition=new|used`` 时在 API 上追加 ``conditions[]=new|used``，``all`` 不传该参数；
     合并后仍按 ``condition`` 做一次全局成色过滤。
 
     合并结果按规范化 ``url`` 去重（仅本次响应内）后，再按 ``condition`` 做二次过滤。
@@ -2009,7 +2238,8 @@ async def api_search(
     返回首个非空页；此时响应含 ``requested_page`` 与 ``page_adjusted``。
 
     每条 ``results``：``title`` / ``image`` / ``price_usd`` / ``price_cny`` / ``source`` /
-    ``url`` / ``condition``（``全新`` 或 ``二手``）。
+    ``url`` / ``condition``（``全新`` 或 ``二手``）/ ``all_images``（图片 URL 数组）/
+    ``description``（商品详情 HTML，无则为空串）。
     """
     q_clean = q.strip()
     if not q_clean:

@@ -11,12 +11,18 @@ from typing import Any
 import httpx
 
 REVERB_API_ROOT = "https://api.reverb.com"
+# 市场搜索列表（与官方分页文档一致）：``GET /api/listings?page=…``
+REVERB_LISTINGS_SEARCH_URL = f"{REVERB_API_ROOT}/api/listings"
 REVERB_WEB_ORIGIN = "https://reverb.com"
 
-DEFAULT_HEADERS = {
-    "Accept": "application/hal+json",
-    "Accept-Version": "3.0",
-}
+
+def reverb_request_headers(access_token: str) -> dict[str, str]:
+    """官方 PAT 请求头：Bearer + v2 Accept（勿与浏览器 UA / hal+json 混用导致行为异常）。"""
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.reverb.v2+json",
+        "Content-Type": "application/json",
+    }
 
 
 def _abs_href(href: str) -> str:
@@ -97,29 +103,53 @@ def listing_to_search_item(listing: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reverb_listings_query_params(
+    query: str,
+    *,
+    page: int,
+    per_page: int,
+    condition: str = "all",
+) -> list[tuple[str, str | int]]:
+    """
+    查询参数：``page``、``query``、``per_page``；成色为 ``new``/``used`` 时追加 ``conditions[]``。
+    使用元组列表以便稳定编码 ``conditions[]=…``。
+    """
+    q = query.strip()
+    cond = (condition or "all").strip().lower()
+    pairs: list[tuple[str, str | int]] = [
+        ("query", q),
+        ("page", max(1, int(page))),
+        ("per_page", int(per_page)),
+    ]
+    if cond == "new":
+        pairs.append(("conditions[]", "new"))
+    elif cond == "used":
+        pairs.append(("conditions[]", "used"))
+    return pairs
+
+
 def search_reverb_listings_sync(
     access_token: str,
     query: str,
     *,
     page: int = 1,
     per_page: int = 24,
+    condition: str = "all",
 ) -> list[dict[str, Any]]:
     """
-    ``GET /api/listings/all``，返回原始 ``listings`` 数组（每项为 HAL 对象）。
+    ``GET https://api.reverb.com/api/listings``，返回原始 ``listings`` 数组（每项为 HAL 风格对象）。
     """
-    url = f"{REVERB_API_ROOT}/api/listings/all"
-    headers = {
-        **DEFAULT_HEADERS,
-        "Authorization": f"Bearer {access_token}",
-    }
-    params = {"query": query.strip(), "page": page, "per_page": per_page}
+    headers = reverb_request_headers(access_token)
+    params = _reverb_listings_query_params(
+        query, page=page, per_page=per_page, condition=condition
+    )
 
-    with httpx.Client(timeout=30.0) as client:
-        r = client.get(url, headers=headers, params=params)
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.get(REVERB_LISTINGS_SEARCH_URL, headers=headers, params=params)
         r.raise_for_status()
         data = r.json()
 
-    return list(data.get("listings") or [])
+    return _extract_listings_from_reverb_payload(data)
 
 
 async def search_reverb_listings_async(
@@ -128,21 +158,37 @@ async def search_reverb_listings_async(
     *,
     page: int = 1,
     per_page: int = 24,
+    condition: str = "all",
 ) -> list[dict[str, Any]]:
     """异步版本，供 FastAPI 路由使用。"""
-    url = f"{REVERB_API_ROOT}/api/listings/all"
-    headers = {
-        **DEFAULT_HEADERS,
-        "Authorization": f"Bearer {access_token}",
-    }
-    params = {"query": query.strip(), "page": page, "per_page": per_page}
+    headers = reverb_request_headers(access_token)
+    params = _reverb_listings_query_params(
+        query, page=page, per_page=per_page, condition=condition
+    )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, headers=headers, params=params)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        r = await client.get(REVERB_LISTINGS_SEARCH_URL, headers=headers, params=params)
         r.raise_for_status()
         data = r.json()
 
-    return list(data.get("listings") or [])
+    return _extract_listings_from_reverb_payload(data)
+
+
+def _extract_listings_from_reverb_payload(data: Any) -> list[dict[str, Any]]:
+    """
+    Reverb 搜索接口历史上曾直接返回 ``listings``；部分环境/HAL 版本下在 ``_embedded.listings``。
+    """
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("listings")
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    emb = data.get("_embedded")
+    if isinstance(emb, dict):
+        inner = emb.get("listings")
+        if isinstance(inner, list):
+            return [x for x in inner if isinstance(x, dict)]
+    return []
 
 
 def fetch_first_listing_title_and_price(

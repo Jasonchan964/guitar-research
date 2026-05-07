@@ -8,6 +8,10 @@ export type UnifiedListing = {
   url: string
   /** 后端统一：`全新` 或 `二手` */
   condition: string
+  /** 多图 URL 列表；无多图平台通常仅含主图 */
+  all_images?: string[]
+  /** 富文本 HTML（Shopify ``body_html``）；可能为空 */
+  description?: string
 }
 
 export type UnifiedSearchApiResponse = {
@@ -28,4 +32,17 @@ export type ReverbListing = {
 export type ReverbSearchApiResponse = {
   query: string
   results: ReverbListing[]
+}
+
+/** ``GET /api/guitar/detail`` 统一详情结构 */
+export type GuitarDetailApi = {
+  title: string
+  price_cny: number | null
+  price_original: string
+  platform: string
+  condition: string
+  images: string[]
+  specs: Record<string, string>
+  description_html: string
+  buy_url: string
 }

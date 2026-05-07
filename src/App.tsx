@@ -1,6 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Link, Route, Routes } from 'react-router-dom'
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react'
 import type { UnifiedListing, UnifiedSearchApiResponse } from './mockGuitars'
+import GuitarDetailPage from './GuitarDetailPage'
 
 const PLACEHOLDER_IMG =
   'data:image/svg+xml,' +
@@ -122,6 +124,10 @@ type PlatformId = (typeof PLATFORM_IDS)[number]
 
 type ConditionFilter = 'all' | 'new' | 'used'
 
+/** 未选中平台药丸：统一浅灰（高明度极简底 + 浅灰字） */
+const PLATFORM_PILL_OFF_CLASS =
+  'border-transparent bg-[#FAFAFA] text-[#CCCCCC] transition-colors hover:bg-[#F2F2F2] dark:bg-[#FAFAFA]/90 dark:text-[#CCCCCC]'
+
 const PLATFORM_META: Record<
   PlatformId,
   { label: string; short: string; onClass: string; offClass: string }
@@ -129,39 +135,50 @@ const PLATFORM_META: Record<
   reverb: {
     label: 'Reverb',
     short: 'Reverb',
-    onClass: 'border-orange-500/90 bg-orange-500 text-white shadow-sm ring-1 ring-orange-500/30',
-    offClass:
-      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    onClass:
+      'border-transparent bg-[#FFF0EB] text-[#E07A5F] shadow-sm transition-colors dark:bg-[#FFF0EB]/95 dark:text-[#E07A5F]',
+    offClass: PLATFORM_PILL_OFF_CLASS,
   },
   digimart: {
     label: 'Digimart',
     short: 'Digimart',
-    onClass: 'border-sky-600/90 bg-sky-600 text-white shadow-sm ring-1 ring-sky-600/30',
-    offClass:
-      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    onClass:
+      'border-transparent bg-[#FFF0F5] text-[#D15C7D] shadow-sm transition-colors dark:bg-[#FFF0F5]/95 dark:text-[#D15C7D]',
+    offClass: PLATFORM_PILL_OFF_CLASS,
   },
   guitarguitar: {
     label: 'GuitarGuitar',
     short: 'GG',
-    onClass: 'border-rose-600/90 bg-rose-600 text-white shadow-sm ring-1 ring-rose-600/30',
-    offClass:
-      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    onClass:
+      'border-transparent bg-[#E6F7F0] text-[#2D9B75] shadow-sm transition-colors dark:bg-[#E6F7F0]/95 dark:text-[#2D9B75]',
+    offClass: PLATFORM_PILL_OFF_CLASS,
   },
   ishibashi: {
     label: 'Ishibashi',
     short: 'Ishibashi',
-    onClass: 'border-red-700/90 bg-red-700 text-white shadow-sm ring-1 ring-red-700/30',
-    offClass:
-      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    onClass:
+      'border-transparent bg-[#E6F2FF] text-[#2B7BC6] shadow-sm transition-colors dark:bg-[#E6F2FF]/95 dark:text-[#2B7BC6]',
+    offClass: PLATFORM_PILL_OFF_CLASS,
   },
   sweelee: {
     label: 'Swee Lee',
     short: 'Swee Lee',
-    onClass: 'border-emerald-600/90 bg-emerald-600 text-white shadow-sm ring-1 ring-emerald-600/30',
-    offClass:
-      'border-slate-200/90 bg-slate-100 text-slate-500 hover:bg-slate-200/80 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    onClass:
+      'border-transparent bg-[#FFF9E6] text-[#B8860B] shadow-sm transition-colors dark:bg-[#FFF9E6]/95 dark:text-[#B8860B]',
+    offClass: PLATFORM_PILL_OFF_CLASS,
   },
 }
+
+/** 列表卡片平台标签：与筛选栏选中态一致的马卡龙浅色 + 淡色描边 */
+const SOURCE_PILL_CLASS: Record<string, string> = {
+  Reverb: 'border-[#E07A5F]/25 bg-[#FFF0EB] text-[#E07A5F] dark:border-[#E07A5F]/30 dark:bg-[#FFF0EB]/95',
+  Digimart: 'border-[#D15C7D]/25 bg-[#FFF0F5] text-[#D15C7D] dark:border-[#D15C7D]/30 dark:bg-[#FFF0F5]/95',
+  GuitarGuitar: 'border-[#2D9B75]/25 bg-[#E6F7F0] text-[#2D9B75] dark:border-[#2D9B75]/30 dark:bg-[#E6F7F0]/95',
+  Ishibashi: 'border-[#2B7BC6]/25 bg-[#E6F2FF] text-[#2B7BC6] dark:border-[#2B7BC6]/30 dark:bg-[#E6F2FF]/95',
+  'Swee Lee': 'border-[#B8860B]/25 bg-[#FFF9E6] text-[#B8860B] dark:border-[#B8860B]/30 dark:bg-[#FFF9E6]/95',
+}
+const SOURCE_PILL_FALLBACK =
+  'border-[#CCCCCC]/40 bg-[#FAFAFA] text-[#CCCCCC] dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400'
 
 const CONDITION_META: Record<
   ConditionFilter,
@@ -320,9 +337,7 @@ function SortOrderMenu({ value, onChange, disabled }: SortOrderMenuProps) {
     return () => document.removeEventListener('keydown', onKey)
   }, [open])
 
-  useEffect(() => {
-    if (disabled) setOpen(false)
-  }, [disabled])
+  const menuOpen = open && !disabled
 
   const options = (Object.keys(SORT_LABELS) as SortOrder[]).map((key) => ({
     key,
@@ -334,7 +349,7 @@ function SortOrderMenu({ value, onChange, disabled }: SortOrderMenuProps) {
       <button
         type="button"
         disabled={disabled}
-        aria-expanded={open}
+        aria-expanded={menuOpen}
         aria-haspopup="listbox"
         aria-controls={listboxId}
         onClick={() => {
@@ -344,13 +359,13 @@ function SortOrderMenu({ value, onChange, disabled }: SortOrderMenuProps) {
       >
         <span className="select-none">{SORT_LABELS[value]}</span>
         <ChevronDown
-          className={`h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 dark:text-slate-500 ${open ? 'rotate-180' : ''}`}
+          className={`h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200 dark:text-slate-500 ${menuOpen ? 'rotate-180' : ''}`}
           strokeWidth={2}
           aria-hidden
         />
       </button>
 
-      {open && (
+      {menuOpen && (
         <ul
           id={listboxId}
           role="listbox"
@@ -572,7 +587,7 @@ type ActiveSearchFilters = {
   condition: ConditionFilter
 }
 
-function App() {
+function SearchHome() {
   const [query, setQuery] = useState('')
   const [submittedQuery, setSubmittedQuery] = useState<string | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
@@ -600,8 +615,6 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    setRateLoading(true)
-    setRateError(false)
     fetch('/api/exchange-rate')
       .then(async (res) => {
         if (!res.ok) throw new Error(await res.text())
@@ -859,57 +872,88 @@ function App() {
                 {displayedListings.map((item, index) => (
                   <li key={item.url ? `${item.url}-${index}` : `row-${index}`} className="min-w-0">
                     <article className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200/90 bg-white shadow-sm transition-shadow duration-200 hover:shadow-md md:rounded-2xl dark:border-slate-700/90 dark:bg-slate-900">
-                      <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
-                        <img
-                          src={item.image || PLACEHOLDER_IMG}
-                          alt=""
-                          className="h-full w-full object-cover object-center"
-                          loading="lazy"
-                          width={640}
-                          height={480}
-                        />
-                      </div>
-                      <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 p-3 text-left sm:gap-2 sm:p-4 md:gap-2.5 md:p-5">
-                        <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
-                          {item.title}
-                        </h2>
-                        <p className="flex shrink-0 flex-wrap items-center gap-1.5">
-                          <span className="inline-flex rounded-full border border-slate-200/80 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600 sm:px-2.5 sm:text-xs dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                            {item.source}
-                          </span>
-                          <span
-                            className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${
-                              item.condition === '全新'
-                                ? 'border-emerald-200/90 bg-emerald-50 text-emerald-700 dark:border-emerald-800/60 dark:bg-emerald-950/45 dark:text-emerald-400'
-                                : 'border-slate-200/90 bg-slate-100 text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400'
-                            }`}
-                          >
-                            {item.condition === '全新' ? '全新' : '二手'}
-                          </span>
-                        </p>
-                        <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
-                          <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
-                          <span className="min-w-0 max-w-full whitespace-nowrap text-sm font-bold sm:text-base">
-                            <UnifiedPriceDisplay
-                              priceUsd={item.price_usd}
-                              priceCny={item.price_cny}
-                              currency={currency}
-                            />
-                          </span>
-                        </p>
-                        {item.url ? (
-                          <p className="mt-auto shrink-0 pt-1.5 sm:pt-2">
-                            <a
-                              href={item.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-xs font-medium text-blue-700 underline-offset-2 hover:underline sm:text-sm dark:text-blue-400"
+                      {item.url ? (
+                        <Link
+                          to={`/guitar?${new URLSearchParams({ url: item.url, platform: item.source }).toString()}`}
+                          className="flex min-h-0 min-w-0 flex-1 flex-col text-left outline-none transition-[box-shadow] focus-visible:ring-2 focus-visible:ring-blue-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-slate-900"
+                        >
+                        <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
+                          <img
+                            src={item.image || PLACEHOLDER_IMG}
+                            alt=""
+                            className="h-full w-full object-cover object-center"
+                            loading="lazy"
+                            width={640}
+                            height={480}
+                          />
+                        </div>
+                        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 p-3 sm:gap-2 sm:p-4 md:gap-2.5 md:p-5">
+                          <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
+                            {item.title}
+                          </h2>
+                          <p className="flex shrink-0 flex-wrap items-center gap-1.5">
+                            <span
+                              className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-medium sm:px-2.5 sm:text-xs ${SOURCE_PILL_CLASS[item.source] ?? SOURCE_PILL_FALLBACK}`}
                             >
-                              前往原网页
-                            </a>
+                              {item.source}
+                            </span>
+                            <span
+                              className={`inline-flex rounded-full border px-2 py-0.5 text-xs ${
+                                item.condition === '全新'
+                                  ? 'border-emerald-200/90 bg-emerald-50 text-emerald-700 dark:border-emerald-800/60 dark:bg-emerald-950/45 dark:text-emerald-400'
+                                  : 'border-slate-200/90 bg-slate-100 text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                              }`}
+                            >
+                              {item.condition === '全新' ? '全新' : '二手'}
+                            </span>
                           </p>
-                        ) : null}
-                      </div>
+                          <p className="flex min-w-0 flex-col gap-0.5 text-xs tabular-nums text-slate-700 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-1 sm:text-sm dark:text-slate-200">
+                            <span className="shrink-0 text-slate-500 dark:text-slate-400">标价</span>
+                            <span className="min-w-0 max-w-full whitespace-nowrap text-sm font-bold sm:text-base">
+                              <UnifiedPriceDisplay
+                                priceUsd={item.price_usd}
+                                priceCny={item.price_cny}
+                                currency={currency}
+                              />
+                            </span>
+                          </p>
+                          <p className="mt-auto shrink-0 pt-1.5 text-[11px] font-medium text-slate-400 sm:pt-2 sm:text-xs dark:text-slate-500">
+                            站内详情页
+                          </p>
+                        </div>
+                        </Link>
+                      ) : (
+                        <div className="flex min-h-0 min-w-0 flex-1 flex-col text-left opacity-60">
+                          <div className="aspect-[4/3] w-full shrink-0 overflow-hidden bg-slate-100 dark:bg-slate-800">
+                            <img
+                              src={item.image || PLACEHOLDER_IMG}
+                              alt=""
+                              className="h-full w-full object-cover object-center"
+                              loading="lazy"
+                              width={640}
+                              height={480}
+                            />
+                          </div>
+                          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 p-3 sm:gap-2 sm:p-4 md:gap-2.5 md:p-5">
+                            <h2 className="line-clamp-2 min-h-0 text-sm font-medium leading-snug text-slate-900 sm:text-[15px] dark:text-slate-50">
+                              {item.title}
+                            </h2>
+                            <p className="text-[11px] text-slate-400">无原站链接</p>
+                          </div>
+                        </div>
+                      )}
+                      {item.url ? (
+                        <div className="border-t border-slate-100 px-3 py-2 dark:border-slate-800/80 sm:px-4">
+                          <a
+                            href={item.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs font-medium text-blue-700 underline-offset-2 hover:underline sm:text-sm dark:text-blue-400"
+                          >
+                            新窗口打开官网
+                          </a>
+                        </div>
+                      ) : null}
                     </article>
                   </li>
                 ))}
@@ -931,4 +975,11 @@ function App() {
   )
 }
 
-export default App
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<SearchHome />} />
+      <Route path="/guitar" element={<GuitarDetailPage />} />
+    </Routes>
+  )
+}
