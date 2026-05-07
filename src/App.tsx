@@ -8,6 +8,8 @@ import AuthToasts from './components/AuthToasts'
 import FavoriteHeart from './components/FavoriteHeart'
 import NavUserMenu from './components/NavUserMenu'
 
+const LAST_SEARCH_RESULTS_KEY = 'last_search_results'
+
 const PLACEHOLDER_IMG =
   'data:image/svg+xml,' +
   encodeURIComponent(
@@ -641,6 +643,22 @@ function SearchHome() {
     }
   }, [])
 
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(LAST_SEARCH_RESULTS_KEY)
+      if (!raw) return
+      const data = JSON.parse(raw) as UnifiedSearchApiResponse
+      if (!data?.results || !Array.isArray(data.results)) return
+      setListings(data.results)
+      setSubmittedQuery(data.query)
+      setQuery(data.query)
+      setCurrentPage(typeof data.page === 'number' && data.page >= 1 ? data.page : 1)
+      setHasMore(Boolean(data.has_more))
+    } catch {
+      /* ignore parse errors or storage access */
+    }
+  }, [])
+
   const rateReady = !rateLoading && exchangeRate != null && !rateError
 
   const enabledPlatformIds = useMemo(
@@ -690,6 +708,11 @@ function SearchHome() {
         throw new Error(msg)
       }
       const data: UnifiedSearchApiResponse = await res.json()
+      try {
+        sessionStorage.setItem(LAST_SEARCH_RESULTS_KEY, JSON.stringify(data))
+      } catch {
+        /* quota / private mode */
+      }
       setListings(data.results)
       setCurrentPage(data.page ?? page)
       setHasMore(Boolean(data.has_more))

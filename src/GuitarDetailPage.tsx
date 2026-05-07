@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import type { GuitarDetailApi } from './mockGuitars'
 import FavoriteHeart from './components/FavoriteHeart'
@@ -28,18 +28,32 @@ function formatCnyPretty(amount: number): string {
   })}`
 }
 
+const DETAIL_BACK_BTN_CLASS =
+  'inline-flex shrink-0 items-center gap-1 text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+
+function DetailBackButton() {
+  const navigate = useNavigate()
+  const handleBack = () => {
+    if (window.history.length > 1) {
+      navigate(-1)
+    } else {
+      navigate('/')
+    }
+  }
+  return (
+    <button type="button" onClick={handleBack} className={DETAIL_BACK_BTN_CLASS}>
+      <ChevronLeft className="h-4 w-4" strokeWidth={2.5} aria-hidden />
+      返回
+    </button>
+  )
+}
+
 function GuitarDetailInvalidParams() {
   return (
     <div className="min-h-svh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
       <header className="border-b border-slate-200/80 bg-white/95 px-4 py-3 backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/95">
         <div className="mx-auto flex max-w-3xl items-center justify-between gap-3">
-          <Link
-            to="/"
-            className="inline-flex shrink-0 items-center gap-1 text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
-          >
-            <ChevronLeft className="h-4 w-4" strokeWidth={2.5} aria-hidden />
-            返回搜索
-          </Link>
+          <DetailBackButton />
           <NavUserMenu compact />
         </div>
       </header>
@@ -125,13 +139,7 @@ function GuitarDetailLoaded({ url, platform }: { url: string; platform: string }
     <div className="min-h-svh bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
       <header className="sticky top-0 z-40 border-b border-slate-200/80 bg-white/95 px-4 py-3 backdrop-blur-md dark:border-slate-800 dark:bg-slate-950/95">
         <div className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-3 gap-y-2">
-          <Link
-            to="/"
-            className="inline-flex shrink-0 items-center gap-1 text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
-          >
-            <ChevronLeft className="h-4 w-4" strokeWidth={2.5} aria-hidden />
-            返回搜索
-          </Link>
+          <DetailBackButton />
           {data ? (
             <span
               className={`inline-flex max-w-[min(100%,12rem)] truncate rounded-full border px-3 py-1 text-xs font-semibold sm:max-w-xs sm:text-sm ${pillClass}`}
