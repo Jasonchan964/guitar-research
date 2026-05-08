@@ -12,6 +12,16 @@ export function formatCnyFromServer(amount: number): string {
   })}`
 }
 
+function normalizePriceField(value: unknown): number | null {
+  if (value == null) return null
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  if (typeof value === 'string') {
+    const n = Number.parseFloat(value.replace(/,/g, '').trim())
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return null
+}
+
 type UnifiedPriceProps = {
   priceUsd: number | null
   priceCny: number | null
@@ -20,8 +30,19 @@ type UnifiedPriceProps = {
 
 /** 使用后端已换算的 ``price_usd`` / ``price_cny`` 切换展示 */
 export default function UnifiedPriceDisplay({ priceUsd, priceCny, currency }: UnifiedPriceProps) {
-  const usdLine = priceUsd != null ? formatUsdPretty(priceUsd) : '—'
-  const cnyLine = priceCny != null ? formatCnyFromServer(priceCny) : '—'
+  const u = normalizePriceField(priceUsd)
+  const c = normalizePriceField(priceCny)
+
+  if (u === null && c === null) {
+    return (
+      <span className="font-semibold tabular-nums text-slate-500 dark:text-slate-400">
+        Price on Request
+      </span>
+    )
+  }
+
+  const usdLine = u != null ? formatUsdPretty(u) : 'N/A'
+  const cnyLine = c != null ? formatCnyFromServer(c) : 'N/A'
   const showCny = currency === 'CNY'
   const showUsd = currency === 'USD'
 

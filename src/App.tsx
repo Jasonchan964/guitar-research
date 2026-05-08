@@ -1,7 +1,11 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { Route, Routes } from 'react-router-dom'
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react'
-import type { UnifiedListing, UnifiedSearchApiResponse } from './mockGuitars'
+import {
+  sanitizeUnifiedSearchResponse,
+  type UnifiedListing,
+  type UnifiedSearchApiResponse,
+} from './mockGuitars'
 import FavoritesPage from './FavoritesPage'
 import GuitarDetailPage from './GuitarDetailPage'
 import AuthModal from './components/AuthModal'
@@ -10,7 +14,8 @@ import CurrencyToggle from './components/CurrencyToggle'
 import NavUserMenu from './components/NavUserMenu'
 import SearchResultListingCard from './components/SearchResultListingCard'
 
-const LAST_SEARCH_RESULTS_KEY = 'last_search_results'
+/** 升级 key，避免读取旧版 sessionStorage 中的畸形缓存 */
+const LAST_SEARCH_RESULTS_KEY = 'last_search_results_v2'
 /** 与后端 ``session_id`` 对齐：同 Tab 会话内跨页剔除已下发的 Reverb URL（仅内存，进程内 TTL） */
 const SEARCH_SESSION_ID_KEY = 'guitar-search-session-id'
 
@@ -320,6 +325,16 @@ function mapSortOrderToApi(order: SortOrder): string {
   return order
 }
 
+function buildSearchCacheKey(
+  trimmed: string,
+  page: number,
+  platformsParam: string,
+  condition: ConditionFilter,
+  sortKey: string,
+): string {
+  return `${trimmed}|${page}|${platformsParam}|${condition}|${sortKey}`
+}
+
 function buildPageRange(current: number, hasMore: boolean): number[] {
   const spread = 2
   const start = Math.max(1, current - spread)
@@ -531,12 +546,14 @@ function SearchHome() {
 
   useEffect(() => {
     try {
+      sessionStorage.removeItem('last_search_results')
       const raw = sessionStorage.getItem(LAST_SEARCH_RESULTS_KEY)
       if (!raw) return
-      const data = JSON.parse(raw) as UnifiedSearchApiResponse
-      if (!data?.results || !Array.isArray(data.results)) return
+      const parsed: unknown = JSON.parse(raw)
+      const data = sanitizeUnifiedSearchResponse(parsed, '')
+      if (!data.results.length && !data.query.trim()) return
       setListings(data.results)
-      setSubmittedQuery(data.query)
+      setSubmittedQuery(data.query || null)
       setQuery(data.query)
       setCurrentPage(typeof data.page === 'number' && data.page >= 1 ? data.page : 1)
       setHasMore(Boolean(data.has_more))
@@ -560,10 +577,56 @@ function SearchHome() {
     setSelectedPlatforms((prev) => ({ ...prev, [id]: !prev[id] }))
   }
 
+  /** 预取命中时的分页缓存（同一查询 / 平台 / 成色 / 排序 / 页码） */
+  const searchPageCacheRef = useRef<Map<string, UnifiedSearchApiResponse>>(new Map())
+  const prefetchAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(
+    () => () => {
+      prefetchAbortRef.current?.abort()
+    },
+    [],
+  )
+
+  const platformsParamLive =
+    enabledPlatformIds.length === PLATFORM_IDS.length ? 'all' : enabledPlatformIds.join(',')
+
+  const applySearchApiResponse = (data: UnifiedSearchApiResponse, trimmedFallback: string) => {
+    const safe = sanitizeUnifiedSearchResponse(data, trimmedFallback)
+    try {
+      sessionStorage.setItem(LAST_SEARCH_RESULTS_KEY, JSON.stringify(safe))
+    } catch {
+      /* quota / private mode */
+    }
+    const resolvedQuery = (safe.query && String(safe.query).trim()) || trimmedFallback
+    setQuery(resolvedQuery)
+    setSubmittedQuery(resolvedQuery)
+    setListings(safe.results)
+    setCurrentPage(typeof safe.page === 'number' && safe.page >= 1 ? safe.page : 1)
+    setHasMore(Boolean(safe.has_more))
+    if (typeof safe.sort === 'string') {
+      if (safe.sort === 'relevance') setSortOrder('default')
+      else if (safe.sort === 'price_asc' || safe.sort === 'price_desc') setSortOrder(safe.sort)
+    }
+    setActiveFilters({
+      platformIds: [...enabledPlatformIds],
+      condition: conditionFilter,
+    })
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    })
+  }
+
   /**
    * 拉取一页结果；顺序完全由后端 ``sort`` 决定，此处不对 ``results`` 做任何 `.sort()`。
+   * 优先使用预取缓存以实现无感翻页。
    */
-  const fetchSearchPage = async (q: string, page: number, sortOverride?: SortOrder) => {
+  const fetchSearchPage = async (
+    q: string,
+    page: number,
+    sortOverride?: SortOrder,
+    options?: { skipCache?: boolean },
+  ) => {
     const trimmed = q.trim()
     if (!trimmed) return
 
@@ -572,19 +635,27 @@ function SearchHome() {
       return
     }
 
+    const sortKey = mapSortOrderToApi(sortOverride ?? sortOrder)
+    const cacheKey = buildSearchCacheKey(trimmed, page, platformsParamLive, conditionFilter, sortKey)
+
+    if (!options?.skipCache) {
+      const hit = searchPageCacheRef.current.get(cacheKey)
+      if (hit) {
+        setError(null)
+        applySearchApiResponse(hit, trimmed)
+        return
+      }
+    }
+
     setListings([])
     setLoading(true)
     setError(null)
 
     try {
-      const platformsParam =
-        enabledPlatformIds.length === PLATFORM_IDS.length ? 'all' : enabledPlatformIds.join(',')
-
-      const sortKey = mapSortOrderToApi(sortOverride ?? sortOrder)
       const qs = new URLSearchParams({
         q: trimmed,
         page: String(page),
-        platforms: platformsParam,
+        platforms: platformsParamLive,
         condition: conditionFilter,
         sort: sortKey,
         session_id: getOrCreateSearchSessionId(),
@@ -611,29 +682,9 @@ function SearchHome() {
         throw new Error(msg)
       }
       const data: UnifiedSearchApiResponse = await res.json()
-      try {
-        sessionStorage.setItem(LAST_SEARCH_RESULTS_KEY, JSON.stringify(data))
-      } catch {
-        /* quota / private mode */
-      }
-      const resolvedQuery = (data.query && String(data.query).trim()) || trimmed
-      setQuery(resolvedQuery)
-      setSubmittedQuery(resolvedQuery)
-      setListings(data.results)
-      setCurrentPage(data.page ?? page)
-      setHasMore(Boolean(data.has_more))
-      if (typeof data.sort === 'string') {
-        if (data.sort === 'relevance') setSortOrder('default')
-        else if (data.sort === 'price_asc' || data.sort === 'price_desc')
-          setSortOrder(data.sort)
-      }
-      setActiveFilters({
-        platformIds: [...enabledPlatformIds],
-        condition: conditionFilter,
-      })
-      requestAnimationFrame(() => {
-        window.scrollTo({ top: 0, behavior: 'smooth' })
-      })
+      const safe = sanitizeUnifiedSearchResponse(data, trimmed)
+      searchPageCacheRef.current.set(cacheKey, safe)
+      applySearchApiResponse(safe, trimmed)
     } catch (e) {
       setListings([])
       setError(e instanceof Error ? e.message : '网络错误')
@@ -642,10 +693,76 @@ function SearchHome() {
     }
   }
 
+  const prefetchNextPage = useCallback(async () => {
+    const q = submittedQuery?.trim()
+    if (!q || !hasMore || loading) return
+    const nextPage = currentPage + 1
+    const sortKey = mapSortOrderToApi(sortOrder)
+    const key = buildSearchCacheKey(q, nextPage, platformsParamLive, conditionFilter, sortKey)
+    if (searchPageCacheRef.current.has(key)) return
+
+    prefetchAbortRef.current?.abort()
+    const ac = new AbortController()
+    prefetchAbortRef.current = ac
+
+    try {
+      const qs = new URLSearchParams({
+        q,
+        page: String(nextPage),
+        platforms: platformsParamLive,
+        condition: conditionFilter,
+        sort: sortKey,
+        session_id: getOrCreateSearchSessionId(),
+      })
+      const headers: HeadersInit = {}
+      try {
+        const tok = localStorage.getItem('token')
+        if (tok?.trim()) headers.Authorization = `Bearer ${tok.trim()}`
+      } catch {
+        /* private mode */
+      }
+      const res = await fetch(`/api/search?${qs.toString()}`, { headers, signal: ac.signal })
+      if (!res.ok) return
+      const data: UnifiedSearchApiResponse = await res.json()
+      const safe = sanitizeUnifiedSearchResponse(data, q)
+      searchPageCacheRef.current.set(key, safe)
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return
+    }
+  }, [
+    submittedQuery,
+    currentPage,
+    hasMore,
+    loading,
+    sortOrder,
+    conditionFilter,
+    platformsParamLive,
+  ])
+
+  useEffect(() => {
+    if (!submittedQuery?.trim() || listings.length === 0) return
+    const onScroll = () => {
+      const el = document.documentElement
+      const h = Math.max(el.scrollHeight, 1)
+      const visibleThrough = (el.scrollTop + el.clientHeight) / h
+      if (visibleThrough >= 0.8) void prefetchNextPage()
+    }
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [submittedQuery, listings.length, prefetchNextPage])
+
+  useEffect(() => {
+    if (!submittedQuery?.trim() || listings.length === 0 || !hasMore) return
+    const t = window.setTimeout(() => void prefetchNextPage(), 2000)
+    return () => clearTimeout(t)
+  }, [submittedQuery, listings.length, hasMore, currentPage, prefetchNextPage])
+
   /** 新关键词搜索：回到第 1 页，相关度优先（须传入 override，避免 ``setSortOrder`` 尚未提交仍用上一次的排序） */
   const runSearchWithQuery = (q: string) => {
     const trimmed = q.trim()
     if (!trimmed) return
+    searchPageCacheRef.current.clear()
+    prefetchAbortRef.current?.abort()
     setSubmittedQuery(trimmed)
     setCurrentPage(1)
     setSortOrder('default')
@@ -670,6 +787,8 @@ function SearchHome() {
   const handleSortChange = (order: SortOrder) => {
     setSortOrder(order)
     if (!submittedQuery || loading) return
+    searchPageCacheRef.current.clear()
+    prefetchAbortRef.current?.abort()
     setCurrentPage(1)
     void fetchSearchPage(submittedQuery, 1, order)
   }
@@ -768,10 +887,12 @@ function SearchHome() {
           </div>
           {submittedQuery && (
             <p className="mb-2 text-center text-sm text-slate-500 dark:text-slate-400">
-              {(activeFilters
+              {(activeFilters &&
+              Array.isArray(activeFilters.platformIds) &&
+              activeFilters.platformIds.length > 0
                 ? `${activeFilters.platformIds
-                    .map((id) => PLATFORM_META[id].label)
-                    .join(' + ')} · 成色：${CONDITION_META[activeFilters.condition].label}`
+                    .map((id) => PLATFORM_META[id]?.label ?? String(id))
+                    .join(' + ')} · 成色：${CONDITION_META[activeFilters.condition]?.label ?? ''}`
                 : '多平台搜索结果') +
                 ` · 「${submittedQuery}」` +
                 ` · 第 ${currentPage} 页` +
@@ -814,12 +935,12 @@ function SearchHome() {
 
           {loading && !error && <ResultsGridSkeleton />}
 
-          {!loading && listings.length > 0 && (
+          {!loading && Array.isArray(listings) && listings.length > 0 && (
             <section className="mt-4" aria-label="搜索结果">
               <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
-                {listings.map((item, index) => (
+                {(listings ?? []).map((item, index) => (
                   <SearchResultListingCard
-                    key={item.url ? `${item.url}-${index}` : `row-${index}`}
+                    key={item?.id ?? (item?.url ? `${item.url}-${index}` : `row-${index}`)}
                     item={item}
                     currency={currency}
                   />
