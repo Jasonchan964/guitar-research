@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 与 ``scrape_reverb`` 使用 Reverb API，仅读取环境变量 ``REVERB_API_TOKEN``。
-`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），支持 ``sort``（``relevance`` / ``price_desc`` / ``price_asc``）；合并多站时在服务端全局排序与分页，并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
+`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），支持 ``sort``（``relevance`` / ``price_desc`` / ``price_asc``）；多站时各平台**同一页码**并发抓取，按固定顺序 **extend** 合并后经过去重 / 成色过滤（自第 ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 页起不做跨平台价格全局重排）；每平台独立 **3s** 超时。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition。
 ``/api/search`` 合并换算只读内存汇率（``resolve_rate_to_cny``），请求路径不发 Frankfurter。
 """
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from contextlib import asynccontextmanager
 import hashlib
 import json
@@ -23,6 +24,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from collections.abc import Awaitable
 from typing import Annotated, Any
 from urllib.parse import quote_plus, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
@@ -109,10 +111,8 @@ DIGIMART_PRODUCT_TYPE_USED = "USED"
 REVERB_PER_PAGE = REVERB_LISTINGS_PER_PAGE_DEFAULT
 # ``/api/search`` 返回给前端的统一分页长度（多站合并后按该宽度切片）
 SEARCH_PAGE_SIZE = REVERB_PER_PAGE
-# 多平台合并时最多向后抓取的平台页数（每轮每站一页），用于凑齐「全局排序」下的第 N 页窗口
-SEARCH_MERGE_MAX_ROUNDS = 15
-# 多站勾选且 ``page`` ≥ 该阈值时：不再多轮累积与全局相关度重排，仅请求各平台当前 ``page`` 合并去重后截取一页宽（显著降低深层分页延迟）
-API_SEARCH_DEEP_PAGE_THRESHOLD = 3
+# 从该页起：多平台不再做跨列表全局排序，合并走轻量 ``extend`` 路径并跳过 Swee Lee 站内二次重排
+SEARCH_FAST_STREAM_PAGE_THRESHOLD = 3
 # Digimart 搜索页常见每页 20 条
 DIGIMART_PER_PAGE = 20
 # 常见桌面 Chrome UA，降低被站点拒绝的概率（仍需遵守对方 robots/条款）
@@ -2100,25 +2100,97 @@ async def search_reverb(
 # 请求第 N 页结果为空时，向后最多再尝试的页数（N+1 … N+API_SEARCH_EMPTY_PAGE_MAX_SKIP）
 API_SEARCH_EMPTY_PAGE_MAX_SKIP = 2
 
-# 搜索合并内 HTTP 限时（与 ``scrape_guitarguitar`` 内 ``httpx`` 一致）
-SEARCH_HTTP_TIMEOUT_SEC = 5.0
+# ``GET /api/search``：同关键词 + 筛选 + 请求页进程内短时缓存（不缓存收藏状态，命中后现查）
+SEARCH_CACHE_TTL_SEC = 300.0
+SEARCH_CACHE_MAX_ENTRIES = 2048
+_SEARCH_CACHE_LOCK = threading.Lock()
+# key -> (monotonic_expire_at, frozen payload dict)
+_SEARCH_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+# 多平台合并搜索：单平台任务墙钟上限（秒）；超时则该平台本轮视为空，其它平台照常返回
+SEARCH_PLATFORM_FETCH_TIMEOUT_SEC = 3.0
+
+
+def _search_result_cache_key(
+    *,
+    q_clean: str,
+    page_req: int,
+    selected: set[str],
+    cond_norm: str,
+    sort_norm: str,
+    sid_norm: str,
+) -> str:
+    blob = json.dumps(
+        {
+            "q": q_clean,
+            "page": page_req,
+            "platforms": sorted(selected),
+            "condition": cond_norm,
+            "sort": sort_norm,
+            "session_id": sid_norm,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _prune_search_result_cache_unlocked() -> None:
+    now = time.monotonic()
+    dead = [k for k, (exp, _) in _SEARCH_RESULT_CACHE.items() if exp <= now]
+    for k in dead:
+        del _SEARCH_RESULT_CACHE[k]
+    while len(_SEARCH_RESULT_CACHE) > SEARCH_CACHE_MAX_ENTRIES:
+        try:
+            _SEARCH_RESULT_CACHE.pop(next(iter(_SEARCH_RESULT_CACHE)))
+        except StopIteration:
+            break
+
+
+def _search_cache_get_unlocked(key: str) -> dict[str, Any] | None:
+    entry = _SEARCH_RESULT_CACHE.get(key)
+    if not entry:
+        return None
+    exp, payload = entry
+    if time.monotonic() >= exp:
+        del _SEARCH_RESULT_CACHE[key]
+        return None
+    return payload
+
+
+def _search_cache_put_unlocked(key: str, payload: dict[str, Any]) -> None:
+    _SEARCH_RESULT_CACHE[key] = (time.monotonic() + SEARCH_CACHE_TTL_SEC, payload)
+    _prune_search_result_cache_unlocked()
+
+
+async def _await_platform_search_list(
+    label: str,
+    coro: Awaitable[Any],
+) -> list[dict[str, Any]]:
+    """并发合并中的一路抓取：严格限时，超时或异常返回空列表，不拖累 ``asyncio.gather`` 其它任务。"""
+    try:
+        out = await asyncio.wait_for(coro, timeout=SEARCH_PLATFORM_FETCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[api/search] platform timeout after %.1fs: %s",
+            SEARCH_PLATFORM_FETCH_TIMEOUT_SEC,
+            label,
+        )
+        return []
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error("[api/search] platform error [%s]: %s", label, e, exc_info=True)
+        return []
+    return out if isinstance(out, list) else []
 
 
 async def _scrape_guitarguitar_for_merge(q_clean: str, pg: int) -> list[dict[str, Any]]:
-    """GuitarGuitar 单独限时；超时或异常返回空列表，不阻塞 Reverb 等其它平台。"""
+    """GuitarGuitar：异常时返回空；墙钟限制由 ``_await_platform_search_list`` 统一施加。"""
     try:
-        return await asyncio.wait_for(
-            scrape_guitarguitar(q_clean, pg),
-            timeout=SEARCH_HTTP_TIMEOUT_SEC,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[GuitarGuitar] merge skipped: timeout %.1fs",
-            SEARCH_HTTP_TIMEOUT_SEC,
-        )
-        return []
+        return await scrape_guitarguitar(q_clean, pg)
     except Exception as e:
-        logger.exception("[GuitarGuitar] merge skipped: %s", e)
+        logger.exception("[GuitarGuitar] merge fetch failed: %s", e)
         return []
 
 
@@ -2128,40 +2200,70 @@ async def _merge_search_single_round(
     selected: set[str],
     cond_norm: str,
     sort_norm: str,
+    *,
+    requested_page: int = 1,
 ) -> tuple[list[dict[str, Any]], bool]:
     """
-    抓取 ``fetch_page`` 对应的一轮（每站同一页码）：各平台请求彼此并发。
+    抓取 ``fetch_page`` 对应的一轮（每站同一页码）：各平台请求经 ``asyncio.gather`` **同时** 发出，
+    每路 ``asyncio.wait_for(..., SEARCH_PLATFORM_FETCH_TIMEOUT_SEC)``，慢站超时返回空列表。
     汇率仅从内存 ``EXCHANGE_RATES`` / ``resolve_rate_to_cny`` 读取，搜索路径不请求 Frankfurter。
-    合并后 **本轮内** URL 去重 → 成色过滤。第三方在支持时携带 Reverb ``order``、Digimart ``sortKey``。
 
+    ``requested_page`` ≥ ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 时：固定顺序 **extend** 拼接各平台换算后的行，
+    跳过 Swee Lee 站内吉他优先重排（省 CPU）；仍会 **去重 + 成色过滤**。前几页可走完整合并（含 Swee 重排）。
+
+    第三方在支持时携带 Reverb ``order``、Digimart ``sortKey``。
     返回 ``(results, has_more)``；若所有平台原始列表均为空则 ``([], False)``。
     """
     pg = max(1, int(fetch_page))
+    fast_stream = max(1, int(requested_page)) >= SEARCH_FAST_STREAM_PAGE_THRESHOLD
 
-    coros: list[Any] = []
+    coros: list[Awaitable[list[dict[str, Any]]]] = []
     labels: list[str] = []
 
     if "reverb" in selected:
         coros.append(
-            _safe_fetch_reverb_listings_for_merge(
-                q_clean, pg, condition=cond_norm, sort=sort_norm
-            ),
+            _await_platform_search_list(
+                "reverb",
+                _safe_fetch_reverb_listings_for_merge(
+                    q_clean, pg, condition=cond_norm, sort=sort_norm
+                ),
+            )
         )
         labels.append("reverb")
     if "digimart" in selected:
-        coros.append(scrape_digimart(q_clean, pg, condition=cond_norm, sort=sort_norm))
+        coros.append(
+            _await_platform_search_list(
+                "digimart",
+                scrape_digimart(q_clean, pg, condition=cond_norm, sort=sort_norm),
+            )
+        )
         labels.append("digimart")
     if "guitarguitar" in selected:
-        coros.append(_scrape_guitarguitar_for_merge(q_clean, pg))
+        coros.append(
+            _await_platform_search_list(
+                "guitarguitar",
+                _scrape_guitarguitar_for_merge(q_clean, pg),
+            )
+        )
         labels.append("guitarguitar")
     if "ishibashi" in selected:
-        coros.append(_safe_scrape_ishibashi(q_clean, pg))
+        coros.append(
+            _await_platform_search_list(
+                "ishibashi",
+                _safe_scrape_ishibashi(q_clean, pg),
+            )
+        )
         labels.append("ishibashi")
     if "sweelee" in selected:
-        coros.append(_safe_scrape_sweelee(q_clean, pg))
+        coros.append(
+            _await_platform_search_list(
+                "sweelee",
+                _safe_scrape_sweelee(q_clean, pg),
+            )
+        )
         labels.append("sweelee")
 
-    gathered = await asyncio.gather(*coros, return_exceptions=True)
+    gathered = await asyncio.gather(*coros)
 
     raw_rev: list[dict[str, Any]] = []
     digi_raw: list[dict[str, Any]] = []
@@ -2171,76 +2273,19 @@ async def _merge_search_single_round(
 
     for name, out in zip(labels, gathered):
         if name == "reverb":
-            if isinstance(out, list):
-                raw_rev = out
-            else:
-                if isinstance(out, BaseException):
-                    logger.error(
-                        "[api/search] Reverb task raised unexpectedly: %r",
-                        out,
-                        exc_info=(type(out), out, out.__traceback__),
-                    )
-                else:
-                    logger.error(
-                        "[api/search] Reverb task returned non-list: %r",
-                        out,
-                    )
+            raw_rev = out
             continue
         if name == "digimart":
-            if isinstance(out, list):
-                digi_raw = out
-            else:
-                logger.error(
-                    "[api/search] Digimart task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
+            digi_raw = out
             continue
         if name == "guitarguitar":
-            if isinstance(out, list):
-                gg_raw = out
-            else:
-                logger.error(
-                    "[api/search] GuitarGuitar task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
+            gg_raw = out
             continue
         if name == "ishibashi":
-            if isinstance(out, list):
-                ishi_raw = out
-            else:
-                logger.error(
-                    "[api/search] Ishibashi task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
+            ishi_raw = out
             continue
         if name == "sweelee":
-            if isinstance(out, list):
-                swee_raw = out
-            else:
-                logger.error(
-                    "[api/search] Swee Lee task returned non-list (unexpected): %r",
-                    out,
-                    exc_info=(
-                        (type(out), out, out.__traceback__)
-                        if isinstance(out, BaseException)
-                        else None
-                    ),
-                )
+            swee_raw = out
 
     if not raw_rev and not digi_raw and not gg_raw and not ishi_raw and not swee_raw:
         return [], False
@@ -2275,11 +2320,10 @@ async def _merge_search_single_round(
     usd_to_cny = rates_map.get("USD") or resolve_rate_to_cny("USD")
     rates_map["USD"] = usd_to_cny
 
-    if swee_raw:
+    if swee_raw and not fast_stream:
         swee_raw = _reorder_sweelee_raw_guitar_priority(swee_raw, rates_map)
 
-    results: list[dict[str, Any]] = []
-
+    reverb_rows: list[dict[str, Any]] = []
     for listing in raw_rev:
         title = str(listing.get("title") or listing.get("name") or "")
         image = extract_first_photo_url(listing)
@@ -2292,7 +2336,7 @@ async def _merge_search_single_round(
                 price_cny = amt
             elif iso in rates_map:
                 price_cny = amt * rates_map[iso]
-        results.append(
+        reverb_rows.append(
             _unified_row(
                 title=title,
                 image=image,
@@ -2304,6 +2348,7 @@ async def _merge_search_single_round(
             )
         )
 
+    digi_rows: list[dict[str, Any]] = []
     for d in digi_raw:
         jpy_amt = int(d["jpy"])
         pcny: float | None = None
@@ -2312,7 +2357,7 @@ async def _merge_search_single_round(
         digi_condition = str(d.get("condition") or "二手")
         if digi_condition not in ("全新", "二手"):
             digi_condition = "二手"
-        results.append(
+        digi_rows.append(
             _unified_row(
                 title=str(d["title"]),
                 image=d.get("image"),
@@ -2325,10 +2370,11 @@ async def _merge_search_single_round(
         )
 
     gbp_rate = _gbp_to_cny_rate(rates_map)
+    gg_rows: list[dict[str, Any]] = []
     for g in gg_raw:
         gbp_amt = float(g["gbp"])
         pcny_gg = gbp_amt * gbp_rate
-        results.append(
+        gg_rows.append(
             _unified_row(
                 title=str(g["title"]),
                 image=g.get("image"),
@@ -2340,6 +2386,7 @@ async def _merge_search_single_round(
             )
         )
 
+    ishi_rows: list[dict[str, Any]] = []
     for ib in ishi_raw:
         amt_ib = float(ib["price_raw"])
         pcny_ib = _ishibashi_amount_to_cny(
@@ -2350,7 +2397,7 @@ async def _merge_search_single_round(
         ib_cond = str(ib.get("condition") or "二手")
         if ib_cond not in ("全新", "二手"):
             ib_cond = "二手"
-        results.append(
+        ishi_rows.append(
             _unified_row(
                 title=str(ib["title"]),
                 image=ib.get("image"),
@@ -2366,6 +2413,7 @@ async def _merge_search_single_round(
             )
         )
 
+    swee_rows: list[dict[str, Any]] = []
     for sw in swee_raw:
         amt_sw = float(sw["price_raw"])
         pcny_sw = _ishibashi_amount_to_cny(
@@ -2376,7 +2424,7 @@ async def _merge_search_single_round(
         sw_cond = str(sw.get("condition") or "二手")
         if sw_cond not in ("全新", "二手"):
             sw_cond = "二手"
-        results.append(
+        swee_rows.append(
             _unified_row(
                 title=str(sw["title"]),
                 image=sw.get("image"),
@@ -2391,6 +2439,14 @@ async def _merge_search_single_round(
                 description=str(sw.get("description") or ""),
             )
         )
+
+    merged: list[dict[str, Any]] = []
+    merged.extend(reverb_rows)
+    merged.extend(digi_rows)
+    merged.extend(gg_rows)
+    merged.extend(ishi_rows)
+    merged.extend(swee_rows)
+    results = merged
 
     before_dedupe = len(results)
     results = _dedupe_results_preserve_order(results)
@@ -2433,15 +2489,21 @@ async def _run_global_search(
     sort_norm: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """
-    统一分页语义下的全局排序结果：
+    统一分页：
 
-    - **仅选一个平台**：直接使用该平台第 ``page_no`` 页（第三方已按 ``sort`` 排序）。
-    - **多平台**：轮询各平台第 ``1 … R`` 页，跨轮 URL 去重后整体排序，再取出全局第
-      ``(page_no-1)*SEARCH_PAGE_SIZE + 1 … page_no*SEARCH_PAGE_SIZE`` 条。
+    - **仅选一个平台**：只请求该平台第 ``page_no`` 页（第三方已按 ``sort`` 排序，必要时服务端再排一次）。
+    - **多平台**：并发各站第 ``page_no`` 页后，按固定顺序 **extend** 合并 → 去重 → 成色过滤 → 截断。
+      第 1–2 页：``price_*`` 仍对本批合并结果做一次全局排序；自第 ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 页起
+      **不再**跨平台重排，直接保留各站 API 顺序（仅依赖各站自身 ``sort``）。
     """
     if len(selected) == 1:
         rows, hm = await _merge_search_single_round(
-            q_clean, page_no, selected, cond_norm, sort_norm
+            q_clean,
+            page_no,
+            selected,
+            cond_norm,
+            sort_norm,
+            requested_page=page_no,
         )
         # 仅 Reverb 时「相关度」已由接口 ``order=relevance`` 排序，不再用标题词频覆盖。
         if sort_norm == "relevance" and selected == {"reverb"}:
@@ -2449,47 +2511,22 @@ async def _run_global_search(
         rows = sort_unified_search_rows(rows, sort_norm, q_clean)
         return rows, hm
 
-    # 多平台：前几页仍做多轮累积 + 全局排序；深层分页改为「各站直接请求第 N 页」合并，避免重复抓取前几页
-    if page_no >= API_SEARCH_DEEP_PAGE_THRESHOLD:
-        batch, hm = await _merge_search_single_round(
-            q_clean, page_no, selected, cond_norm, sort_norm
-        )
-        # 相关度：沿用各平台 API 顺序，不做标题词频全局重排；价格排序仅对本批合并结果排序（体量小）
-        if sort_norm in ("price_desc", "price_asc"):
-            batch = sort_unified_search_rows(batch, sort_norm, q_clean)
-        overflow = len(batch) > SEARCH_PAGE_SIZE
-        window = batch[:SEARCH_PAGE_SIZE]
-        has_more = hm or overflow
-        return window, has_more
-
-    seen: set[str] = set()
-    acc: list[dict[str, Any]] = []
-    last_has_more = False
-    need = page_no * SEARCH_PAGE_SIZE
-    max_r = min(SEARCH_MERGE_MAX_ROUNDS, max(page_no + 8, 4))
-
-    for r in range(1, max_r + 1):
-        batch, hm = await _merge_search_single_round(
-            q_clean, r, selected, cond_norm, sort_norm
-        )
-        last_has_more = hm
-        for row in batch:
-            key = _normalize_url_for_dedup(str(row.get("url") or ""))
-            if key and key in seen:
-                continue
-            if key:
-                seen.add(key)
-            acc.append(row)
-        acc = sort_unified_search_rows(acc, sort_norm, q_clean)
-        if len(acc) >= need:
-            break
-        if not batch:
-            break
-
-    start = (page_no - 1) * SEARCH_PAGE_SIZE
-    end = start + SEARCH_PAGE_SIZE
-    window = acc[start:end]
-    has_more = len(acc) > end or last_has_more
+    batch, hm = await _merge_search_single_round(
+        q_clean,
+        page_no,
+        selected,
+        cond_norm,
+        sort_norm,
+        requested_page=page_no,
+    )
+    if (
+        sort_norm in ("price_desc", "price_asc")
+        and page_no < SEARCH_FAST_STREAM_PAGE_THRESHOLD
+    ):
+        batch = sort_unified_search_rows(batch, sort_norm, q_clean)
+    overflow = len(batch) > SEARCH_PAGE_SIZE
+    window = batch[:SEARCH_PAGE_SIZE]
+    has_more = hm or overflow
     return window, has_more
 
 
@@ -2537,8 +2574,8 @@ async def api_search(
     sort: str = Query(
         "relevance",
         description=(
-            "排序：``relevance``（默认，相关度优先）| ``price_desc`` | ``price_asc``；"
-            "多站合并时在服务端做全局排序与分页"
+            "排序：``relevance``（默认）| ``price_desc`` | ``price_asc``；"
+            "多站时各平台仅请求当前 ``page``；``price_*`` 在第 1–2 页对本页合并结果排序，第 3 页起不做跨平台全局重排"
         ),
     ),
     session_id: str = Query(
@@ -2553,16 +2590,22 @@ async def api_search(
     """
     按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
 
-    性能：各平台爬虫并发；汇率仅在内存读取。已登录时
-    仅对**当前页商品 URL** 做一条 ``IN`` 查询填充 ``is_favorited``，不加载全量收藏表。
+    性能：各平台第 ``page`` 路并发；每路 ``asyncio.wait_for`` **3s** 封顶，超时该平台本轮为空。
+    汇率仅在内存读取。已登录时仅对**当前页商品 URL** 做一条 ``IN`` 查询填充 ``is_favorited``。
 
     Digimart：``condition=new|used`` 时先在请求上加 ``productTypes``（新品/中古），再解析列表；
     Reverb：``condition=new|used`` 时在 API 上追加 ``conditions[]=new|used``，``all`` 不传该参数；
     合并后仍按 ``condition`` 做一次全局成色过滤。
 
+    **多页排序**：第 1–2 页可对合并结果做一次 ``price_*`` 全局排序；自第 **3** 页起仅按固定顺序 **extend**
+    拼接（Reverb → Digimart → GuitarGuitar → Ishibashi → Swee Lee），不再跨平台全局重排。
+
     合并结果按规范化 ``url`` 去重（仅本次响应内）后，再按 ``condition`` 做二次过滤。
     Reverb：API 返回的单页列表在 ``reverb_client`` 内按稳定 listing 主键去重；若传 ``session_id``，
     同一搜索快照下跨页会跳过已下发过的 Reverb 商品（规范化 URL，进程内 TTL 缓存）。
+
+    **结果缓存**：内存缓存 **5 分钟**（``SEARCH_CACHE_TTL_SEC``），键为关键词 + 页码 + 平台 + 成色 + 排序 +
+    ``session_id``；缓存**不含**收藏标记，命中后不访问各站爬虫。短时间在第 2 / 4 页间跳转可复用同一份缓存。
 
     当 ``page>1`` 且过滤后结果为空时，自动向后最多尝试 ``API_SEARCH_EMPTY_PAGE_MAX_SKIP`` 页，
     返回首个非空页；此时响应含 ``requested_page`` 与 ``page_adjusted``。
@@ -2621,24 +2664,62 @@ async def api_search(
             sid_norm=sid_norm,
             scope_sig=scope_sig,
         )
-        results, has_more = await _api_search_collect_page(page_no=page_no, **page_kw)
 
-        effective_page = page_no
-        page_adjusted = False
+        cache_key = _search_result_cache_key(
+            q_clean=q_clean,
+            page_req=page_no,
+            selected=selected,
+            cond_norm=cond_norm,
+            sort_norm=sort_norm,
+            sid_norm=sid_norm,
+        )
 
-        if page_no > 1 and len(results) == 0:
-            for step in range(1, API_SEARCH_EMPTY_PAGE_MAX_SKIP + 1):
-                fp = page_no + step
-                results, has_more = await _api_search_collect_page(page_no=fp, **page_kw)
-                if len(results) > 0:
-                    effective_page = fp
-                    page_adjusted = True
-                    logger.info(
-                        "[api/search] empty-page forward: requested=%s effective=%s",
-                        page_no,
-                        fp,
-                    )
-                    break
+        cached_snapshot: dict[str, Any] | None = None
+        with _SEARCH_CACHE_LOCK:
+            _prune_search_result_cache_unlocked()
+            cached_snapshot = _search_cache_get_unlocked(cache_key)
+
+        if cached_snapshot is not None:
+            logger.info(
+                "[api/search] cache hit key=%s… query=%r page=%s",
+                cache_key[:12],
+                q_clean,
+                page_no,
+            )
+            results = copy.deepcopy(cached_snapshot["results_rows"])
+            has_more = bool(cached_snapshot["has_more"])
+            effective_page = int(cached_snapshot["effective_page"])
+            page_adjusted = bool(cached_snapshot["page_adjusted"])
+        else:
+            results, has_more = await _api_search_collect_page(page_no=page_no, **page_kw)
+
+            effective_page = page_no
+            page_adjusted = False
+
+            if page_no > 1 and len(results) == 0:
+                for step in range(1, API_SEARCH_EMPTY_PAGE_MAX_SKIP + 1):
+                    fp = page_no + step
+                    results, has_more = await _api_search_collect_page(page_no=fp, **page_kw)
+                    if len(results) > 0:
+                        effective_page = fp
+                        page_adjusted = True
+                        logger.info(
+                            "[api/search] empty-page forward: requested=%s effective=%s",
+                            page_no,
+                            fp,
+                        )
+                        break
+
+            with _SEARCH_CACHE_LOCK:
+                _search_cache_put_unlocked(
+                    cache_key,
+                    {
+                        "results_rows": copy.deepcopy(results),
+                        "has_more": has_more,
+                        "effective_page": effective_page,
+                        "page_adjusted": page_adjusted,
+                    },
+                )
 
         if current_user is not None:
             norm_keys = [

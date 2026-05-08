@@ -335,6 +335,25 @@ function buildSearchCacheKey(
   return `${trimmed}|${page}|${platformsParam}|${condition}|${sortKey}`
 }
 
+/** 距文档底部阈值（px）内视为触底，触发下一页预取 */
+const SCROLL_PREFETCH_BOTTOM_PX = 80
+
+/** 翻页时在视口顶端显示的轻量进度条（不占布局） */
+function PaginationProgressBar() {
+  return (
+    <div
+      className="pointer-events-none fixed top-0 right-0 left-0 z-[60] h-0.5 overflow-hidden bg-slate-200/80 dark:bg-slate-700/90"
+      role="progressbar"
+      aria-busy="true"
+      aria-label="正在加载搜索结果"
+      aria-valuemin={0}
+      aria-valuemax={100}
+    >
+      <div className="h-full w-[28%] max-w-xl animate-search-pagination-bar rounded-full bg-slate-900/85 shadow-sm dark:bg-slate-50/85" />
+    </div>
+  )
+}
+
 function buildPageRange(current: number, hasMore: boolean): number[] {
   const spread = 2
   const start = Math.max(1, current - spread)
@@ -507,6 +526,8 @@ function SearchHome() {
   const [listings, setListings] = useState<UnifiedListing[]>([])
   const [sortOrder, setSortOrder] = useState<SortOrder>('default')
   const [loading, setLoading] = useState(false)
+  /** 翻页/保留列表时的轻量顶栏，与全页骨架区分 */
+  const [paginationOverlay, setPaginationOverlay] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const [selectedPlatforms, setSelectedPlatforms] = useState<Record<PlatformId, boolean>>(
@@ -625,7 +646,7 @@ function SearchHome() {
     q: string,
     page: number,
     sortOverride?: SortOrder,
-    options?: { skipCache?: boolean },
+    options?: { skipCache?: boolean; keepCurrentResults?: boolean },
   ) => {
     const trimmed = q.trim()
     if (!trimmed) return
@@ -637,17 +658,22 @@ function SearchHome() {
 
     const sortKey = mapSortOrderToApi(sortOverride ?? sortOrder)
     const cacheKey = buildSearchCacheKey(trimmed, page, platformsParamLive, conditionFilter, sortKey)
+    const keepCurrentResults = Boolean(options?.keepCurrentResults)
 
     if (!options?.skipCache) {
       const hit = searchPageCacheRef.current.get(cacheKey)
       if (hit) {
         setError(null)
+        setPaginationOverlay(false)
         applySearchApiResponse(hit, trimmed)
         return
       }
     }
 
-    setListings([])
+    if (!keepCurrentResults) {
+      setListings([])
+    }
+    setPaginationOverlay(keepCurrentResults)
     setLoading(true)
     setError(null)
 
@@ -686,10 +712,11 @@ function SearchHome() {
       searchPageCacheRef.current.set(cacheKey, safe)
       applySearchApiResponse(safe, trimmed)
     } catch (e) {
-      setListings([])
+      if (!keepCurrentResults) setListings([])
       setError(e instanceof Error ? e.message : '网络错误')
     } finally {
       setLoading(false)
+      setPaginationOverlay(false)
     }
   }
 
@@ -740,22 +767,15 @@ function SearchHome() {
   ])
 
   useEffect(() => {
-    if (!submittedQuery?.trim() || listings.length === 0) return
+    if (!submittedQuery?.trim()) return
     const onScroll = () => {
       const el = document.documentElement
-      const h = Math.max(el.scrollHeight, 1)
-      const visibleThrough = (el.scrollTop + el.clientHeight) / h
-      if (visibleThrough >= 0.8) void prefetchNextPage()
+      const remaining = el.scrollHeight - el.scrollTop - el.clientHeight
+      if (remaining <= SCROLL_PREFETCH_BOTTOM_PX) void prefetchNextPage()
     }
     window.addEventListener('scroll', onScroll, { passive: true })
     return () => window.removeEventListener('scroll', onScroll)
-  }, [submittedQuery, listings.length, prefetchNextPage])
-
-  useEffect(() => {
-    if (!submittedQuery?.trim() || listings.length === 0 || !hasMore) return
-    const t = window.setTimeout(() => void prefetchNextPage(), 2000)
-    return () => clearTimeout(t)
-  }, [submittedQuery, listings.length, hasMore, currentPage, prefetchNextPage])
+  }, [submittedQuery, prefetchNextPage])
 
   /** 新关键词搜索：回到第 1 页，相关度优先（须传入 override，避免 ``setSortOrder`` 尚未提交仍用上一次的排序） */
   const runSearchWithQuery = (q: string) => {
@@ -763,6 +783,7 @@ function SearchHome() {
     if (!trimmed) return
     searchPageCacheRef.current.clear()
     prefetchAbortRef.current?.abort()
+    setPaginationOverlay(false)
     setSubmittedQuery(trimmed)
     setCurrentPage(1)
     setSortOrder('default')
@@ -781,7 +802,9 @@ function SearchHome() {
       return
     }
     setCurrentPage(page)
-    void fetchSearchPage(submittedQuery, page)
+    void fetchSearchPage(submittedQuery, page, undefined, {
+      keepCurrentResults: listings.length > 0,
+    })
   }
 
   const handleSortChange = (order: SortOrder) => {
@@ -789,6 +812,7 @@ function SearchHome() {
     if (!submittedQuery || loading) return
     searchPageCacheRef.current.clear()
     prefetchAbortRef.current?.abort()
+    setPaginationOverlay(false)
     setCurrentPage(1)
     void fetchSearchPage(submittedQuery, 1, order)
   }
@@ -875,7 +899,8 @@ function SearchHome() {
           </div>
         </main>
       ) : (
-        <main className="mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
+        <main className="relative mx-auto max-w-6xl px-4 pb-20 pt-10 sm:px-6">
+          {paginationOverlay ? <PaginationProgressBar /> : null}
           <div className="mx-auto mb-6 max-w-4xl">
             <FilterToolbar
               selectedPlatforms={selectedPlatforms}
@@ -916,7 +941,8 @@ function SearchHome() {
               aria-live="polite"
             >
               <p className="min-h-[1.375rem] flex-1 text-center text-sm font-medium text-slate-500 dark:text-slate-400 sm:min-w-0 sm:text-left">
-                {loading && '正在搜寻全球货源…'}
+                {loading && paginationOverlay && '正在加载下一页…'}
+                {loading && !paginationOverlay && '正在搜寻全球货源…'}
                 {!loading && listings.length > 0 && (
                   <>🔍 为您找到 {listings.length} 个全球淘琴结果</>
                 )}
@@ -933,11 +959,17 @@ function SearchHome() {
             </div>
           )}
 
-          {loading && !error && <ResultsGridSkeleton />}
+          {loading && !paginationOverlay && !error && <ResultsGridSkeleton />}
 
-          {!loading && Array.isArray(listings) && listings.length > 0 && (
-            <section className="mt-4" aria-label="搜索结果">
-              <ul className="grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4">
+          {!error && Array.isArray(listings) && listings.length > 0 && (
+            <section
+              className="relative mt-4"
+              aria-label="搜索结果"
+              aria-busy={paginationOverlay}
+            >
+              <ul
+                className={`grid grid-cols-2 gap-3 md:grid-cols-3 md:gap-6 lg:grid-cols-4 transition-opacity duration-200 ${paginationOverlay ? 'opacity-90' : 'opacity-100'}`}
+              >
                 {(listings ?? []).map((item, index) => (
                   <SearchResultListingCard
                     key={item?.id ?? (item?.url ? `${item.url}-${index}` : `row-${index}`)}

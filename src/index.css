@@ -37,6 +37,27 @@
   animation: heart-pop 0.38s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/** 翻页时顶端不确定进度条 */
+@keyframes search-pagination-bar {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+.animate-search-pagination-bar {
+  animation: search-pagination-bar 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-search-pagination-bar {
+    animation: none;
+    opacity: 0.85;
+  }
+}
+
 body {
   margin: 0;
 }
