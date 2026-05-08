@@ -678,22 +678,16 @@ def _condition_from_description_text(desc: str) -> str:
     return app_main._classify_new_vs_used_from_text(desc)
 
 
-async def _amount_to_cny(client: httpx.AsyncClient, amount: float, currency: str) -> float | None:
-    import main as app_main
+def _amount_to_cny(amount: float, currency: str) -> float:
+    """站内原价→人民币：只读进程内 ``EXCHANGE_RATES``，与搜索路径一致。"""
+    from exchange_rate_cache import resolve_rate_to_cny
 
     cur = (currency or "USD").strip().upper()[:3]
     if not cur:
         cur = "USD"
     if cur == "CNY":
         return float(amount)
-    try:
-        rates = await app_main.get_rates_to_cny(client, {cur})
-    except Exception as e:
-        logger.warning("[guitar/detail] rate fetch failed: %s", e)
-        return None
-    if cur in rates:
-        return float(amount) * rates[cur]
-    return None
+    return float(amount) * resolve_rate_to_cny(cur)
 
 
 def _format_price_original(amount: float, currency: str) -> str:
@@ -740,7 +734,7 @@ async def _fetch_shopify_detail(client: httpx.AsyncClient, page_url: str, plat: 
         cur = "JPY" if plat == "ishibashi" else "SGD"
     price_cny = None
     if amt is not None:
-        price_cny = await _amount_to_cny(client, amt, cur)
+        price_cny = _amount_to_cny(amt, cur)
     price_original = _format_price_original(amt, cur) if amt is not None else ""
 
     import main as app_main
@@ -778,7 +772,7 @@ async def _fetch_digimart_detail(client: httpx.AsyncClient, page_url: str) -> di
     price_original = ""
     if jpy is not None:
         price_original = f"{jpy} JPY"
-        price_cny = await _amount_to_cny(client, float(jpy), "JPY")
+        price_cny = _amount_to_cny(float(jpy), "JPY")
     return {
         "title": title or "商品",
         "price_cny": round(price_cny, 2) if price_cny is not None else None,
@@ -900,7 +894,7 @@ async def _fetch_reverb_detail(client: httpx.AsyncClient, page_url: str) -> dict
     else:
         c = cur or "USD"
         price_original = _format_price_original(amt, c)
-        price_cny = await _amount_to_cny(client, amt, c)
+        price_cny = _amount_to_cny(amt, c)
 
     cond = app_main._reverb_condition_cn(listing)
     buy = extract_listing_web_url(listing).strip() or page_url.strip()
@@ -943,7 +937,7 @@ async def _fetch_guitarguitar_detail(client: httpx.AsyncClient, page_url: str) -
     else:
         c = cur or "GBP"
         price_original = _format_price_original(amt, c)
-        price_cny = await _amount_to_cny(client, amt, c)
+        price_cny = _amount_to_cny(amt, c)
     desc_html = _description_from_ld_or_meta(soup, ld)
     specs: dict[str, str] = _reverb_specs_from_ld(ld)
     for dl in soup.select("dl"):

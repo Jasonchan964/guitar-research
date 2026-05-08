@@ -1,9 +1,8 @@
 """
-USD/CNY：ExchangeRate-API v6 pair + 进程内内存缓存（默认 1 小时）。
+进程内汇率：``EXCHANGE_RATES`` 默认值 + 启动时从 Frankfurter 拉取更新。
 
-未配置密钥或上游失败时返回静态备选汇率，避免 ``GET /api/exchange-rate`` 503 拖垮前端。
-
-文档：https://www.exchangerate-api.com/docs/pair-conversion-requests
+搜索与详情只读内存字典，不发起汇率 HTTP。刷新失败（超时、503 等）保留上次成功值或默认值，仅 ``warning`` 日志。
+文档：https://www.frankfurter.app/docs/
 """
 
 from __future__ import annotations
@@ -11,57 +10,112 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
-from typing import Any
+from typing import Final
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-CACHE_TTL_SEC = 3600
+FRANKFURTER: Final[str] = "https://api.frankfurter.dev/v1/latest"
+FX_HTTP_TIMEOUT: Final[float] = 2.0
 
-PAIR_URL_TEMPLATE = "https://v6.exchangerate-api.com/v6/{api_key}/pair/USD/CNY"
+# 1 单位 ISO 货币 → CNY；启动成功后由 Frankfurter 覆盖对应键。
+EXCHANGE_RATES: dict[str, float] = {
+    "USD": 7.2,
+    "GBP": 9.2,
+    "JPY": 0.046,
+    "SGD": 5.35,
+}
 
-_lock = asyncio.Lock()
-_cache: dict[str, Any] = {"rate": None, "expires_at": 0.0}
+REFRESH_ISO_CODES: Final[tuple[str, ...]] = ("USD", "GBP", "JPY", "SGD")
 
-FALLBACK_USD_CNY = float(os.getenv("FALLBACK_USD_CNY", "7.2"))
+
+def fallback_rate_to_cny(iso: str) -> float:
+    """未出现在 ``EXCHANGE_RATES`` 或键从未刷新成功时的静态/环境备选：1 单位 ``iso`` → CNY。"""
+    u = (iso or "USD").strip().upper()[:3]
+    if u == "CNY":
+        return 1.0
+    defaults = {"USD": 7.2, "GBP": 9.2, "JPY": 0.046, "SGD": 5.35}
+    env_keys = {
+        "USD": "FALLBACK_USD_CNY",
+        "GBP": "FALLBACK_GBP_CNY",
+        "JPY": "FALLBACK_JPY_CNY",
+        "SGD": "FALLBACK_SGD_CNY",
+    }
+    if u in env_keys:
+        raw = os.getenv(env_keys[u], str(defaults[u])).strip()
+        try:
+            v = float(raw)
+            return v if v > 0 else defaults[u]
+        except ValueError:
+            return defaults[u]
+    return defaults["USD"]
+
+
+def resolve_rate_to_cny(iso: str) -> float:
+    """搜索/详情换算：优先内存缓存，否则 ``fallback_rate_to_cny``。"""
+    u = (iso or "USD").strip().upper()[:3]
+    if u == "CNY":
+        return 1.0
+    if u in EXCHANGE_RATES:
+        return float(EXCHANGE_RATES[u])
+    return fallback_rate_to_cny(iso)
+
+
+async def refresh_exchange_rates() -> None:
+    """
+    启动时调用：并行请求 Frankfurter，``timeout=2``；单项失败保留原有 ``EXCHANGE_RATES[code]``。
+    """
+    global EXCHANGE_RATES
+    merged = dict(EXCHANGE_RATES)
+
+    async def fetch_one(
+        client: httpx.AsyncClient, code: str
+    ) -> tuple[str, float | None]:
+        try:
+            r = await client.get(
+                FRANKFURTER,
+                params={"from": code, "to": "CNY"},
+            )
+            if r.status_code >= 500:
+                logger.warning(
+                    "[fx] Frankfurter %s→CNY HTTP %s; keeping %.4f",
+                    code,
+                    r.status_code,
+                    merged.get(code, float("nan")),
+                )
+                return code, None
+            r.raise_for_status()
+            data = r.json()
+            rate = float(data["rates"]["CNY"])
+            if rate <= 0:
+                raise ValueError("non-positive rate")
+            return code, rate
+        except Exception as e:
+            prev = merged.get(code)
+            logger.warning(
+                "[fx] Frankfurter %s→CNY refresh failed (%s); keeping prior %.4f",
+                code,
+                e,
+                prev if prev is not None else fallback_rate_to_cny(code),
+            )
+            return code, None
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(FX_HTTP_TIMEOUT),
+        follow_redirects=True,
+    ) as client:
+        pairs = await asyncio.gather(
+            *[fetch_one(client, c) for c in REFRESH_ISO_CODES],
+        )
+
+    for code, rate in pairs:
+        if rate is not None:
+            merged[code] = rate
+
+    EXCHANGE_RATES = merged
 
 
 async def get_usd_cny_rate_cached() -> float:
-    """返回 1 USD 折合多少 CNY；同一进程内 1 小时内复用缓存；失败时永不抛错。"""
-    async with _lock:
-        now = time.monotonic()
-        expires_at = float(_cache["expires_at"])
-        if _cache["rate"] is not None and now < expires_at:
-            return float(_cache["rate"])
-
-        api_key = os.environ.get("EXCHANGE_RATE_API_KEY", "").strip()
-        if not api_key:
-            logger.warning(
-                "EXCHANGE_RATE_API_KEY unset; using fallback USD/CNY=%s",
-                FALLBACK_USD_CNY,
-            )
-            return FALLBACK_USD_CNY
-
-        url = PAIR_URL_TEMPLATE.format(api_key=api_key)
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("result") == "error":
-                err_type = data.get("error-type", "unknown")
-                raise RuntimeError(f"ExchangeRate-API error-type={err_type}")
-            rate = float(data["conversion_rate"])
-        except Exception as e:
-            logger.warning(
-                "ExchangeRate-API USD/CNY failed (%s); using fallback %s",
-                e,
-                FALLBACK_USD_CNY,
-            )
-            return FALLBACK_USD_CNY
-
-        _cache["rate"] = rate
-        _cache["expires_at"] = now + CACHE_TTL_SEC
-        return rate
+    """供 ``GET /api/exchange-rate`` 使用：仅从内存读取（启动时已尝试刷新）。"""
+    return float(EXCHANGE_RATES.get("USD") or fallback_rate_to_cny("USD"))

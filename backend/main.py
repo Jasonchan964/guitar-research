@@ -1,13 +1,13 @@
 """
-吉他搜索测试后端：根据实时汇率把多币种价格换算成人民币（CNY）。
+吉他搜索测试后端：根据内存缓存汇率把多币种价格换算成人民币（CNY）。
 
-汇率来源：Frankfurter（欧洲央行参考汇率，免费、无需 API Key）
+汇率：进程内 ``EXCHANGE_RATES``（默认 USD/GBP 等），应用启动时用 Frankfurter 刷新一次（``exchange_rate_cache``）。
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 与 ``scrape_reverb`` 使用 Reverb API，仅读取环境变量 ``REVERB_API_TOKEN``。
 `GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），支持 ``sort``（``relevance`` / ``price_desc`` / ``price_asc``）；合并多站时在服务端全局排序与分页，并按 ``condition`` 在合并去重后过滤成色；单方失败返回空列表，不影响其余平台。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition。
-``/api/search`` 合并阶段换算使用静态备选汇率（``_fallback_rate_to_cny``），不依赖外网汇率接口。
+``/api/search`` 合并换算只读内存汇率（``resolve_rate_to_cny``），请求路径不发 Frankfurter。
 """
 
 from __future__ import annotations
@@ -57,11 +57,26 @@ print(
 from database import SessionLocal, init_db
 from deps import get_current_user_optional
 from url_normalize import normalize_original_url
-from exchange_rate_cache import get_usd_cny_rate_cached
+from exchange_rate_cache import get_usd_cny_rate_cached, refresh_exchange_rates, resolve_rate_to_cny
 from guitar_detail import fetch_guitar_detail
 from routers.auth import router as auth_router
 from routers.favorites import router as favorites_router
 from scrapers.guitarguitar import GUITARGUITAR_FULL_PAGE, GUITARGUITAR_ORIGIN, scrape_guitarguitar
+from scrapers.sweelee import (
+    SWEELEE_ACCESSORY_DEMOTE_SUBSTRINGS,
+    SWEELEE_BROWSER_HEADERS,
+    SWEELEE_FORCE_CURRENCY_PARAMS,
+    SWEELEE_GUITAR_BOOST_SUBSTRINGS,
+    SWEELEE_HAS_MORE_HINT,
+    SWEELEE_MAX_CATALOG_PAGES_WALK,
+    SWEELEE_MIN_PREFERRED_PRICE_CNY,
+    SWEELEE_ORIGIN,
+    SWEELEE_PAGE_LIMIT,
+    SWEELEE_PRODUCTS_JSON,
+    SWEELEE_SEARCH_JSON,
+    SWEELEE_SUGGEST_JSON,
+    SWEELEE_SUGGEST_LIMIT,
+)
 
 if not logging.root.handlers:
     logging.basicConfig(
@@ -79,33 +94,6 @@ from reverb_client import (
     listing_to_search_item,
     search_reverb_listings_async,
 )
-
-FRANKFURTER = "https://api.frankfurter.dev/v1/latest"
-
-
-def _fallback_rate_to_cny(iso: str) -> float:
-    """
-    Frankfurter / 第三方汇率不可用时的静态备选：1 单位 ``iso`` 折合多少 CNY。
-    可通过环境变量覆盖：``FALLBACK_USD_CNY``、``FALLBACK_GBP_CNY``、``FALLBACK_JPY_CNY``、``FALLBACK_SGD_CNY``。
-    """
-    u = (iso or "USD").strip().upper()[:3]
-    if u == "CNY":
-        return 1.0
-    defaults = {"USD": 7.2, "GBP": 9.2, "JPY": 0.046, "SGD": 5.35}
-    env_keys = {
-        "USD": "FALLBACK_USD_CNY",
-        "GBP": "FALLBACK_GBP_CNY",
-        "JPY": "FALLBACK_JPY_CNY",
-        "SGD": "FALLBACK_SGD_CNY",
-    }
-    if u in env_keys:
-        raw = os.getenv(env_keys[u], str(defaults[u])).strip()
-        try:
-            v = float(raw)
-            return v if v > 0 else defaults[u]
-        except ValueError:
-            return defaults[u]
-    return defaults["USD"]
 
 # 与 Dockerfile 一致：构建产物在仓库根目录的 dist/，由同一进程托管前端（公网单域名）
 DIST_DIR = Path(__file__).resolve().parent.parent / "dist"
@@ -166,27 +154,112 @@ ISHIBASHI_BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
 }
 
-SWEELEE_ORIGIN = "https://www.sweelee.com.sg"
-SWEELEE_SEARCH_JSON = f"{SWEELEE_ORIGIN}/search.json"
-SWEELEE_SUGGEST_JSON = f"{SWEELEE_ORIGIN}/search/suggest.json"
-SWEELEE_PRODUCTS_JSON = f"{SWEELEE_ORIGIN}/products.json"
-SWEELEE_SUGGEST_LIMIT = 24
-SWEELEE_PRODUCTS_LIMIT = 50
-SWEELEE_HAS_MORE_HINT = 24
-SWEELEE_FORCE_CURRENCY_PARAMS = {"currency": "SGD"}
-SWEELEE_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*;q=0.1",
-    "Accept-Language": "en-SG,en-US;q=0.9,en;q=0.8",
-}
+# Swee Lee：常见吉他品牌（小写，用于词边界匹配）
+SWEELEE_SINGLE_WORD_BRANDS: frozenset[str] = frozenset(
+    {
+        "fender",
+        "gibson",
+        "ibanez",
+        "prs",
+        "squier",
+        "epiphone",
+        "yamaha",
+        "taylor",
+        "martin",
+        "maton",
+        "guild",
+        "rickenbacker",
+        "jackson",
+        "charvel",
+        "schecter",
+        "esp",
+        "ltd",
+        "gretsch",
+        "sterling",
+        "suhr",
+        "cort",
+        "washburn",
+        "strandberg",
+        "mayones",
+        "caparison",
+        "fgn",
+        "kiesel",
+        "heritage",
+        "duesenberg",
+        "dangelico",
+        "godin",
+        "seagull",
+        "alvarez",
+        "lag",
+        "hartke",
+    }
+)
+SWEELEE_MULTI_WORD_BRANDS: frozenset[str] = frozenset(
+    {
+        "paul reed smith",
+        "music man",
+        "musicman",
+        "harley benton",
+        "sterling by music man",
+        "tom anderson",
+        "d angelico",
+        "d'angelico",
+    }
+)
+_SWEELEE_CATEGORY_FILTER_KEY = "filter.p.m.custom.category"
+_SWEELEE_ELECTRIC_GUITARS_CATEGORY = "Electric Guitars"
+# 含以下意图时不强加「电吉他」集合过滤 / 品牌扩词，以免误伤 bass、原声、配件等
+_SWEELEE_SKIP_GUITAR_CATEGORY_BOOST = re.compile(
+    r"\b("
+    r"bass|acoustic|classical|ukulele|violin|mandolin|banjo|lap\s*steel|"
+    r"amp|amplifier|amps|pedal|pedals|cab|cabinets?|"
+    r"interface|headphones?|strings?|strap|cables?|tuner|capo|picks?|"
+    r"vinyl|drum|piano|keyboard|microphone|mic\b"
+    r")\b",
+    re.I,
+)
+
+
+def _sweelee_query_starts_with_brand(lower: str, tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    joined = " ".join(tokens)
+    for phrase in SWEELEE_MULTI_WORD_BRANDS:
+        if lower == phrase or lower.startswith(phrase + " "):
+            return True
+    return tokens[0] in SWEELEE_SINGLE_WORD_BRANDS
+
+
+def _sweelee_brand_boost(keyword: str) -> tuple[str, dict[str, str]]:
+    """
+    针对「Fender」这类品牌词：为 Swee Lee Shopify 搜索附加分类过滤（与站点 URL 中
+    ``filter.p.m.custom.category=Electric+Guitars`` 一致），并在仅单个品牌词时将
+    ``q`` 扩成 ``… Electric Guitar`` 以提高吉他本体在建议结果中的权重。
+    """
+    q0 = (keyword or "").strip()
+    if not q0:
+        return q0, {}
+    lower = q0.lower()
+    if _SWEELEE_SKIP_GUITAR_CATEGORY_BOOST.search(lower):
+        return q0, {}
+    tokens = [t for t in re.split(r"\s+", lower) if t]
+    extra: dict[str, str] = {}
+    if _sweelee_query_starts_with_brand(lower, tokens):
+        extra[_SWEELEE_CATEGORY_FILTER_KEY] = _SWEELEE_ELECTRIC_GUITARS_CATEGORY
+    expand = False
+    if len(tokens) == 1 and tokens[0] in SWEELEE_SINGLE_WORD_BRANDS:
+        expand = True
+    elif joined := " ".join(tokens):
+        if joined in SWEELEE_MULTI_WORD_BRANDS:
+            expand = True
+    api_q = f"{q0} Electric Guitar" if expand else q0
+    return api_q, extra
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    await refresh_exchange_rates()
     yield
 
 
@@ -223,44 +296,6 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(favorites_router)
-
-
-async def fetch_cny_rate(client: httpx.AsyncClient, currency: str) -> float:
-    """返回 1 单位 ``currency`` 等于多少 CNY（Frankfurter）；失败时由调用方回落静态汇率。"""
-    if currency == "CNY":
-        return 1.0
-    r = await client.get(
-        FRANKFURTER,
-        params={"from": currency, "to": "CNY"},
-        follow_redirects=True,
-    )
-    r.raise_for_status()
-    data = r.json()
-    try:
-        return float(data["rates"]["CNY"])
-    except (KeyError, TypeError, ValueError) as e:
-        raise ValueError(f"Frankfurter 响应异常: {e}") from e
-
-
-async def get_rates_to_cny(client: httpx.AsyncClient, currencies: set[str]) -> dict[str, float]:
-    """逐币种请求；单次失败不拖垮整站搜索，写入静态备选汇率。"""
-    currencies = set(currencies)
-    currencies.discard("CNY")
-    if not currencies:
-        return {}
-    out: dict[str, float] = {}
-    for c in sorted(currencies):
-        try:
-            out[c] = await fetch_cny_rate(client, c)
-        except Exception as e:
-            logger.warning(
-                "[fx] Frankfurter %s→CNY failed (%s); using fallback %.4f",
-                c,
-                e,
-                _fallback_rate_to_cny(c),
-            )
-            out[c] = _fallback_rate_to_cny(c)
-    return out
 
 
 def _load_favorite_hits_for_urls_sync(user_id: int, normalized_urls: list[str]) -> frozenset[str]:
@@ -314,7 +349,7 @@ def _compact_search_api_item(row: dict[str, Any]) -> dict[str, Any]:
 
 def _gbp_to_cny_rate(rates_map: dict[str, float]) -> float:
     """
-    1 GBP → CNY。优先 Frankfurter；缺失时使用环境变量 ``GBP_CNY_RATE``（默认 9.15）。
+    1 GBP → CNY。优先 ``rates_map``（内存汇价）；缺失时使用环境变量 ``GBP_CNY_RATE``（默认 9.15）。
     """
     if "GBP" in rates_map:
         return rates_map["GBP"]
@@ -947,7 +982,7 @@ def _ishibashi_amount_to_cny(
     rates_map: dict[str, float],
 ) -> float | None:
     """
-    按 JSON 中的真实标价货币换算为 CNY；与全站 Frankfurter 汇价一致。
+    按 JSON 中的真实标价货币换算为 CNY；与全站内存汇价一致。
     若未识别货币或缺失汇价，则按 JPY 兜底（与 ``original_currency`` 默认为 JPY 对齐）。
     """
     cur = _ishibashi_normalize_iso_currency(original_currency) or "JPY"
@@ -1103,7 +1138,7 @@ def _sweelee_product_to_raw(
 async def scrape_ishibashi(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
     石桥乐器国际站（Shopify）：所有请求带 ``currency=JPY``，尽量固定标价口径；
-    仍从每条 JSON 解析 ``original_currency`` + ``price_raw``，由 ``/api/search`` 侧按 Frankfurter 换算。
+    仍从每条 JSON 解析 ``original_currency`` + ``price_raw``，由 ``/api/search`` 侧按内存汇价换算。
 
     优先 ``/search.json``；若返回非 JSON 或无效，则依次使用 ``/search/suggest.json`` 与
     ``products.json`` 内存筛选。异常或超时返回空列表，不向外抛错。
@@ -1274,19 +1309,30 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     """
     Swee Lee 新加坡站：优先调用官方 Shopify 风格 ``search.json``（与设计 URL 对齐）；
     若当前主题为 Headless/React 以至返回 HTML，则降级 ``search/suggest.json`` 与
-    ``products.json`` 分页筛选（与 Ishibashi 合并策略同源）。
+    ``products.json``。
+
+    **分页**：站内与 JSON 均使用查询参数 ``page``（1-based），不用 ``offset``。
+    回退路径下 ``products.json`` 是按全店目录分页的：必须顺序扫描目录页并按关键词命中做
+    ``skip/take``，不能把目录页码直接当作搜索页码（详见 ``scrapers/sweelee`` 模块注释）。
 
     标价货币：解析 JSON 中真实 ``original_currency``；缺省为 ``SGD``；``currency=SGD``
     参数用于尽量固定标价口径。
     """
-    q = keyword.strip()
-    if not q:
+    q_raw = keyword.strip()
+    if not q_raw:
         logger.info("[Swee Lee] scrape skipped (empty keyword)")
         return []
 
     pg = max(1, int(page))
+    q_api, sweelee_boost_params = _sweelee_brand_boost(q_raw)
 
-    logger.info("[Swee Lee] scrape start keyword=%r page=%s", q, pg)
+    logger.info(
+        "[Swee Lee] scrape start keyword=%r api_q=%r page=%s boost=%r",
+        q_raw,
+        q_api,
+        pg,
+        sweelee_boost_params,
+    )
 
     try:
         async with httpx.AsyncClient(
@@ -1294,7 +1340,6 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
             follow_redirects=True,
         ) as client:
             merged_entries: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
-            seen_handles: set[str] = set()
             payload_search: dict[str, Any] | None = None
 
             products_primary: list[dict[str, Any]] = []
@@ -1302,9 +1347,10 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
                 SWEELEE_SEARCH_JSON,
                 params={
                     **SWEELEE_FORCE_CURRENCY_PARAMS,
-                    "q": q,
+                    **sweelee_boost_params,
+                    "q": q_api,
                     "page": pg,
-                    "limit": 24,
+                    "limit": SWEELEE_PAGE_LIMIT,
                 },
                 headers=SWEELEE_BROWSER_HEADERS,
             )
@@ -1324,74 +1370,98 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
                     h = p.get("handle")
                     if isinstance(h, str) and h and h.strip():
                         merged_entries.append((p, root_ps))
-                        seen_handles.add(h.strip())
             else:
-                if pg == 1:
-                    r_suggest = await client.get(
-                        SWEELEE_SUGGEST_JSON,
-                        params={
-                            **SWEELEE_FORCE_CURRENCY_PARAMS,
-                            "q": q,
-                            "resources[type]": "product",
-                            "resources[limit]": str(
-                                min(SWEELEE_SUGGEST_LIMIT, 50),
-                            ),
-                        },
-                        headers=SWEELEE_BROWSER_HEADERS,
-                    )
-                    if r_suggest.status_code == 200 and _ishibashi_response_looks_json(
-                        r_suggest
-                    ):
-                        try:
-                            sug_payload = r_suggest.json()
-                            sug_products = _sweelee_products_from_suggest_payload(
-                                sug_payload,
-                            )
-                            sug_root = (
-                                sug_payload if isinstance(sug_payload, dict) else None
-                            )
-                            for p in sug_products:
-                                h = p.get("handle")
-                                if isinstance(h, str) and h and h not in seen_handles:
-                                    merged_entries.append((p, sug_root))
-                                    seen_handles.add(h)
-                        except Exception:
-                            pass
+                stride = SWEELEE_PAGE_LIMIT
+                skip_n = (pg - 1) * stride
+                need_end = skip_n + stride
+                matches_stream: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+                seen_handles: set[str] = set()
 
-                r_fb = await client.get(
-                    SWEELEE_PRODUCTS_JSON,
+                def _append_by_handle(
+                    prod: dict[str, Any],
+                    root: dict[str, Any] | None,
+                ) -> None:
+                    hx = prod.get("handle")
+                    if not isinstance(hx, str) or not hx.strip():
+                        return
+                    hs = hx.strip()
+                    if hs in seen_handles:
+                        return
+                    seen_handles.add(hs)
+                    matches_stream.append((prod, root))
+
+                r_suggest = await client.get(
+                    SWEELEE_SUGGEST_JSON,
                     params={
                         **SWEELEE_FORCE_CURRENCY_PARAMS,
-                        "limit": SWEELEE_PRODUCTS_LIMIT,
-                        "page": pg,
+                        **sweelee_boost_params,
+                        "q": q_api,
+                        "resources[type]": "product",
+                        "resources[limit]": str(SWEELEE_SUGGEST_LIMIT),
                     },
                     headers=SWEELEE_BROWSER_HEADERS,
                 )
-                if r_fb.status_code == 200 and _ishibashi_response_looks_json(r_fb):
+                if r_suggest.status_code == 200 and _ishibashi_response_looks_json(
+                    r_suggest
+                ):
                     try:
-                        fb_payload = r_fb.json()
-                        fb_root = fb_payload if isinstance(fb_payload, dict) else None
-                        fb_all = fb_payload.get("products")
-                        if isinstance(fb_all, list):
-                            for p in fb_all:
-                                if not isinstance(p, dict):
-                                    continue
-                                h = p.get("handle")
-                                if (
-                                    not isinstance(h, str)
-                                    or not h
-                                    or h in seen_handles
-                                ):
-                                    continue
-                                if _ishibashi_matches_keyword(
-                                    str(p.get("title") or ""),
-                                    str(p.get("vendor") or ""),
-                                    q,
-                                ):
-                                    merged_entries.append((p, fb_root))
-                                    seen_handles.add(h)
+                        sug_payload = r_suggest.json()
+                        sug_products = _sweelee_products_from_suggest_payload(
+                            sug_payload,
+                        )
+                        sug_root = (
+                            sug_payload if isinstance(sug_payload, dict) else None
+                        )
+                        for p in sug_products:
+                            if isinstance(p, dict):
+                                _append_by_handle(p, sug_root)
                     except Exception:
                         pass
+
+                cat_page = 1
+                while (
+                    len(matches_stream) < need_end
+                    and cat_page <= SWEELEE_MAX_CATALOG_PAGES_WALK
+                ):
+                    r_fb = await client.get(
+                        SWEELEE_PRODUCTS_JSON,
+                        params={
+                            **SWEELEE_FORCE_CURRENCY_PARAMS,
+                            **sweelee_boost_params,
+                            "limit": stride,
+                            "page": cat_page,
+                        },
+                        headers=SWEELEE_BROWSER_HEADERS,
+                    )
+                    if r_fb.status_code == 200 and _ishibashi_response_looks_json(r_fb):
+                        try:
+                            fb_payload = r_fb.json()
+                            fb_root = (
+                                fb_payload if isinstance(fb_payload, dict) else None
+                            )
+                            fb_all = fb_payload.get("products")
+                            if isinstance(fb_all, list):
+                                for p in fb_all:
+                                    if not isinstance(p, dict):
+                                        continue
+                                    hx = p.get("handle")
+                                    if (
+                                        not isinstance(hx, str)
+                                        or not hx.strip()
+                                        or hx.strip() in seen_handles
+                                    ):
+                                        continue
+                                    if _ishibashi_matches_keyword(
+                                        str(p.get("title") or ""),
+                                        str(p.get("vendor") or ""),
+                                        q_raw,
+                                    ):
+                                        _append_by_handle(p, fb_root)
+                        except Exception:
+                            pass
+                    cat_page += 1
+
+                merged_entries = matches_stream[skip_n:need_end]
 
             out: list[dict[str, Any]] = []
             for prod, root_ctx in merged_entries:
@@ -1401,7 +1471,7 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
 
             logger.info(
                 "[Swee Lee] scrape success keyword=%r page=%s items=%s",
-                q,
+                q_raw,
                 pg,
                 len(out),
             )
@@ -1409,7 +1479,7 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
 
     except Exception as e:
         line = (
-            f"[Swee Lee] scrape_sweelee error | keyword={q!r} page={pg} | "
+            f"[Swee Lee] scrape_sweelee error | keyword={q_raw!r} page={pg} | "
             f"type={type(e).__name__} | details={str(e)}"
         )
         print(line, flush=True)
@@ -1438,15 +1508,15 @@ async def scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
 
 
 async def _safe_scrape_sweelee(keyword: str, page: int = 1) -> list[dict[str, Any]]:
-    """供 ``/api/search`` 合并：强制 10 秒兜底，不因 Swee Lee 卡住主链路。"""
+    """供 ``/api/search`` 合并：限时兜底；目录回退需连续翻页，略高于单请求超时。"""
     q = keyword.strip()
     if not q:
         return []
     pg = max(1, int(page))
     try:
-        return await asyncio.wait_for(scrape_sweelee(q, pg), timeout=10.0)
+        return await asyncio.wait_for(scrape_sweelee(q, pg), timeout=22.0)
     except asyncio.TimeoutError:
-        logger.warning("[Swee Lee] asyncio.wait_for timeout (10s) keyword=%r page=%s", q, pg)
+        logger.warning("[Swee Lee] asyncio.wait_for timeout (22s) keyword=%r page=%s", q, pg)
         return []
     except Exception as e:
         logger.error("[Swee Lee] _safe_scrape_sweelee unexpected: %s", e, exc_info=True)
@@ -1839,6 +1909,68 @@ def _price_sort_tuple_asc(row: dict[str, Any]) -> tuple[int, float]:
         return (1, 0.0)
 
 
+def _sweelee_relevance_sort_adjustment(row: dict[str, Any]) -> float:
+    """
+    仅在 ``relevance`` 合并排序时生效：Swee Lee 行在统一 ``-keyword_score`` 上叠加。
+    正值推后（配件、低价），负值略提前（吉他关键词）。与 ``_reorder_sweelee_raw_guitar_priority``
+    方向一致。
+    """
+    if row.get("source") != "Swee Lee":
+        return 0.0
+    title = str(row.get("title") or "").lower()
+    if any(s in title for s in SWEELEE_ACCESSORY_DEMOTE_SUBSTRINGS):
+        return 5000.0
+    p_raw = row.get("price_cny")
+    try:
+        pcny = float(p_raw) if p_raw is not None else None
+    except (TypeError, ValueError):
+        pcny = None
+    adj = 0.0
+    if pcny is None or pcny < float(SWEELEE_MIN_PREFERRED_PRICE_CNY):
+        adj += 800.0
+    boost = sum(1 for tok in SWEELEE_GUITAR_BOOST_SUBSTRINGS if tok in title)
+    adj -= float(boost) * 120.0
+    return adj
+
+
+def _reorder_sweelee_raw_guitar_priority(
+    swee_raw: list[dict[str, Any]],
+    rates_map: dict[str, float],
+) -> list[dict[str, Any]]:
+    """
+    Swee Lee 原始行合并前重排：优先展示高价 + 标题含吉他型号词；低价（< 阈值）次之；
+    背带 / 拨片 / 线材等配件固定置底。不改变条数，仅调整顺序。
+    """
+    if len(swee_raw) <= 1:
+        return swee_raw
+
+    def row_key(idx: int, sw: dict[str, Any]) -> tuple[int, float, str, int]:
+        title = str(sw.get("title") or "")
+        tl = title.lower()
+        is_acc = any(s in tl for s in SWEELEE_ACCESSORY_DEMOTE_SUBSTRINGS)
+        try:
+            amt = float(sw["price_raw"])
+        except (TypeError, ValueError, KeyError):
+            amt = 0.0
+        pcny = _ishibashi_amount_to_cny(
+            amt,
+            str(sw.get("original_currency") or "SGD"),
+            rates_map,
+        )
+        if is_acc:
+            return (2, 0.0, title.casefold(), idx)
+        low = pcny is None or float(pcny) < float(SWEELEE_MIN_PREFERRED_PRICE_CNY)
+        bucket = 1 if low else 0
+        boost = float(
+            sum(1 for tok in SWEELEE_GUITAR_BOOST_SUBSTRINGS if tok in tl),
+        )
+        return (bucket, -boost, title.casefold(), idx)
+
+    pairs = list(enumerate(swee_raw))
+    pairs.sort(key=lambda iv: row_key(iv[0], iv[1]))
+    return [sw for _, sw in pairs]
+
+
 def sort_unified_search_rows(
     rows: list[dict[str, Any]],
     sort_norm: str,
@@ -1853,7 +1985,8 @@ def sort_unified_search_rows(
 
         def rel_key(r: dict[str, Any]) -> tuple[float, str]:
             sc = _keyword_title_match_score(str(r.get("title") or ""), query)
-            return (-sc, str(r.get("title") or ""))
+            adj = _sweelee_relevance_sort_adjustment(r)
+            return (-sc + adj, str(r.get("title") or ""))
 
         return sorted(rows, key=rel_key)
     return rows
@@ -1881,9 +2014,7 @@ async def health() -> dict[str, str]:
 @app.get("/api/exchange-rate")
 async def exchange_rate() -> dict[str, float]:
     """
-    USD→CNY 参考汇率（ExchangeRate-API v6），进程内缓存 1 小时。
-
-    环境变量：``EXCHANGE_RATE_API_KEY``
+    USD→CNY 参考汇率：读进程内 ``EXCHANGE_RATES``（启动时已尝试从 Frankfurter 刷新）。
     """
     rate = await get_usd_cny_rate_cached()
     return {"rate": round(rate, 4)}
@@ -1903,7 +2034,7 @@ async def api_guitar_detail(
     ),
 ) -> dict[str, Any]:
     """
-    站内详情页数据：按平台抓取高清图、规格与描述，并换算 ``price_cny``（Frankfurter）。
+    站内详情页数据：按平台抓取高清图、规格与描述，并换算 ``price_cny``（内存汇率）。
 
     返回字段：``title`` / ``price_cny`` / ``price_original`` / ``platform`` / ``condition`` /
     ``images`` / ``specs`` / ``description_html`` / ``buy_url``。
@@ -2000,7 +2131,7 @@ async def _merge_search_single_round(
 ) -> tuple[list[dict[str, Any]], bool]:
     """
     抓取 ``fetch_page`` 对应的一轮（每站同一页码）：各平台请求彼此并发。
-    汇率 **不** 请求外网，全部使用 ``_fallback_rate_to_cny`` 静态表，避免搜索被汇率 API 拖死。
+    汇率仅从内存 ``EXCHANGE_RATES`` / ``resolve_rate_to_cny`` 读取，搜索路径不请求 Frankfurter。
     合并后 **本轮内** URL 去重 → 成色过滤。第三方在支持时携带 Reverb ``order``、Digimart ``sortKey``。
 
     返回 ``(results, has_more)``；若所有平台原始列表均为空则 ``([], False)``。
@@ -2139,10 +2270,13 @@ async def _merge_search_single_round(
         currencies.add(sc)
 
     rates_map: dict[str, float] = {
-        iso: _fallback_rate_to_cny(iso) for iso in currencies
+        iso: resolve_rate_to_cny(iso) for iso in currencies
     }
-    usd_to_cny = rates_map.get("USD") or _fallback_rate_to_cny("USD")
+    usd_to_cny = rates_map.get("USD") or resolve_rate_to_cny("USD")
     rates_map["USD"] = usd_to_cny
+
+    if swee_raw:
+        swee_raw = _reorder_sweelee_raw_guitar_priority(swee_raw, rates_map)
 
     results: list[dict[str, Any]] = []
 
@@ -2419,7 +2553,7 @@ async def api_search(
     """
     按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
 
-    性能：**各平台爬虫**与 **Frankfurter 汇率预取**在同一轮 ``asyncio.gather`` 中并发。已登录时
+    性能：各平台爬虫并发；汇率仅在内存读取。已登录时
     仅对**当前页商品 URL** 做一条 ``IN`` 查询填充 ``is_favorited``，不加载全量收藏表。
 
     Digimart：``condition=new|used`` 时先在请求上加 ``productTypes``（新品/中古），再解析列表；
