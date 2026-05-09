@@ -21,7 +21,14 @@ export type UnifiedListing = {
 export type UnifiedSearchApiResponse = {
   query: string
   page: number
+  /** 逻辑当前页（与 ``page`` 一致；空页向前对齐时即为后端采纳的页码） */
+  current_page?: number
   has_more: boolean
+  /**
+   * 下一页请求可附带：`scope + sid + p=n+1` 的 urlsafe 载荷，便于与逻辑分页对齐。
+   * 仍以查询参数 ``page`` 为主。
+   */
+  next_page_token?: string
   /** 后端实际采用的排序：``relevance`` | ``price_desc`` | ``price_asc`` */
   sort?: string
   results: UnifiedListing[]
@@ -142,9 +149,21 @@ export function sanitizeUnifiedSearchResponse(
   const q =
     typeof d.query === 'string' && d.query.trim() ? d.query.trim() : fallbackQuery.trim()
   const page = typeof d.page === 'number' && Number.isFinite(d.page) && d.page >= 1 ? d.page : 1
+  const current_page =
+    typeof d.current_page === 'number' &&
+    Number.isFinite(d.current_page) &&
+    d.current_page >= 1
+      ? d.current_page
+      : page
+  const next_page_token =
+    typeof d.next_page_token === 'string' && d.next_page_token.trim()
+      ? d.next_page_token.trim()
+      : undefined
   return {
     query: q,
     page,
+    current_page,
+    ...(next_page_token !== undefined ? { next_page_token } : {}),
     has_more: Boolean(d.has_more),
     sort: typeof d.sort === 'string' ? d.sort : undefined,
     results,

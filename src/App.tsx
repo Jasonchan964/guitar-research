@@ -541,6 +541,12 @@ function SearchHome() {
   const [rateLoading, setRateLoading] = useState(true)
   const [rateError, setRateError] = useState(false)
 
+  /** 预取命中时的分页缓存（同一查询 / 平台 / 成色 / 排序 / 页码） */
+  const searchPageCacheRef = useRef<Map<string, UnifiedSearchApiResponse>>(new Map())
+  /** 上一页返回的 ``next_page_token``（与逻辑页对齐；预留给后续纯 token 翻页） */
+  const nextPageTokenRef = useRef<string | null>(null)
+  const prefetchAbortRef = useRef<AbortController | null>(null)
+
   useEffect(() => {
     let cancelled = false
     fetch('/api/exchange-rate')
@@ -576,7 +582,17 @@ function SearchHome() {
       setListings(data.results)
       setSubmittedQuery(data.query || null)
       setQuery(data.query)
-      setCurrentPage(typeof data.page === 'number' && data.page >= 1 ? data.page : 1)
+      const ep =
+        typeof data.current_page === 'number' && data.current_page >= 1
+          ? data.current_page
+          : typeof data.page === 'number' && data.page >= 1
+            ? data.page
+            : 1
+      setCurrentPage(ep)
+      nextPageTokenRef.current =
+        typeof data.next_page_token === 'string' && data.next_page_token.trim()
+          ? data.next_page_token.trim()
+          : null
       setHasMore(Boolean(data.has_more))
       if (typeof data.sort === 'string') {
         if (data.sort === 'relevance') setSortOrder('default')
@@ -597,10 +613,6 @@ function SearchHome() {
   const togglePlatform = (id: PlatformId) => {
     setSelectedPlatforms((prev) => ({ ...prev, [id]: !prev[id] }))
   }
-
-  /** 预取命中时的分页缓存（同一查询 / 平台 / 成色 / 排序 / 页码） */
-  const searchPageCacheRef = useRef<Map<string, UnifiedSearchApiResponse>>(new Map())
-  const prefetchAbortRef = useRef<AbortController | null>(null)
 
   useEffect(
     () => () => {
@@ -623,7 +635,17 @@ function SearchHome() {
     setQuery(resolvedQuery)
     setSubmittedQuery(resolvedQuery)
     setListings(safe.results)
-    setCurrentPage(typeof safe.page === 'number' && safe.page >= 1 ? safe.page : 1)
+    const ep =
+      typeof safe.current_page === 'number' && safe.current_page >= 1
+        ? safe.current_page
+        : typeof safe.page === 'number' && safe.page >= 1
+          ? safe.page
+          : 1
+    setCurrentPage(ep)
+    nextPageTokenRef.current =
+      typeof safe.next_page_token === 'string' && safe.next_page_token.trim()
+        ? safe.next_page_token.trim()
+        : null
     setHasMore(Boolean(safe.has_more))
     if (typeof safe.sort === 'string') {
       if (safe.sort === 'relevance') setSortOrder('default')
@@ -668,6 +690,10 @@ function SearchHome() {
         applySearchApiResponse(hit, trimmed)
         return
       }
+    }
+
+    if (page === 1) {
+      nextPageTokenRef.current = null
     }
 
     if (!keepCurrentResults) {

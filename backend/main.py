@@ -5,7 +5,7 @@
 文档：https://www.frankfurter.app/docs/
 
 另：`GET /search` 与 ``scrape_reverb`` 使用 Reverb API，仅读取环境变量 ``REVERB_API_TOKEN``。
-`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），支持 ``sort``（``relevance`` / ``price_desc`` / ``price_asc``）；多站时各平台**同一页码**并发抓取，按固定顺序 **extend** 合并后经过去重 / 成色过滤（自第 ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 页起不做跨平台价格全局重排）；每平台独立 **3s** 超时。
+`GET /api/search` 可按 ``platforms`` 仅抓取勾选站点（默认五站全开），支持 ``sort``（``relevance`` / ``price_desc`` / ``price_asc``）；多站时以对称平台页游标 + **超量并行翻页**凑满 ``SEARCH_RESULTS_PAGE_SIZE``（20）条，全局去重 / 排序后对各平台 **轮询插槽** 再切片；某平台无新货时由仍有数据的平台补齐；自第 ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 页起不做跨平台价格全局重排；每平台独立 **3s** 超时。
 返回统一结构：title / image / price_usd / price_cny / source / url / condition。
 ``/api/search`` 合并换算只读内存汇率（``resolve_rate_to_cny``），请求路径不发 Frankfurter。
 """
@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
@@ -109,8 +111,8 @@ DIGIMART_PRODUCT_TYPE_NEW = "NEW"
 DIGIMART_PRODUCT_TYPE_USED = "USED"
 # Reverb ``per_page``（与 ``reverb_client.REVERB_LISTINGS_PER_PAGE_DEFAULT`` 一致）与列表「满页」启发式
 REVERB_PER_PAGE = REVERB_LISTINGS_PER_PAGE_DEFAULT
-# ``/api/search`` 返回给前端的统一分页长度（多站合并后按该宽度切片）
-SEARCH_PAGE_SIZE = REVERB_PER_PAGE
+# ``/api/search`` 合并列表返回给前端的每页条数（与各平台 API 单页条数无关）
+SEARCH_RESULTS_PAGE_SIZE = 20
 # 从该页起：多平台不再做跨列表全局排序，合并走轻量 ``extend`` 路径并跳过 Swee Lee 站内二次重排
 SEARCH_FAST_STREAM_PAGE_THRESHOLD = 3
 # Digimart 搜索页常见每页 20 条
@@ -1992,6 +1994,97 @@ def sort_unified_search_rows(
     return rows
 
 
+# 合并列表卡片 ``source`` → 与 ``platforms`` slug 一致的小写键（用于平衡分发分桶）
+_SOURCE_LABEL_TO_PLATFORM_SLUG: dict[str, str] = {
+    "Reverb": "reverb",
+    "Digimart": "digimart",
+    "GuitarGuitar": "guitarguitar",
+    "Ishibashi": "ishibashi",
+    "Swee Lee": "sweelee",
+}
+# 平衡轮询顺序（与 ``_merge_search_single_round`` 原始 extend 顺序一致）
+_MERGE_PLATFORM_SLUG_ORDER: tuple[str, ...] = (
+    "reverb",
+    "digimart",
+    "guitarguitar",
+    "ishibashi",
+    "sweelee",
+)
+
+
+def _split_rows_by_platform_slug(
+    rows: list[dict[str, Any]],
+    selected: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    buckets: dict[str, list[dict[str, Any]]] = {s: [] for s in selected}
+    for r in rows:
+        slug = _SOURCE_LABEL_TO_PLATFORM_SLUG.get(str(r.get("source") or "").strip())
+        if slug and slug in buckets:
+            buckets[slug].append(r)
+    return buckets
+
+
+def _interleave_round_robin_take(
+    buckets: dict[str, list[dict[str, Any]]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """
+    按 ``_MERGE_PLATFORM_SLUG_ORDER`` 轮询取条目；某平台耗尽则跳过，由仍有库存的平台补齐坑位。
+    """
+    keys = [k for k in _MERGE_PLATFORM_SLUG_ORDER if k in buckets]
+    if not keys:
+        return [], {k: list(v) for k, v in buckets.items()}
+    out: list[dict[str, Any]] = []
+    idx: dict[str, int] = {k: 0 for k in keys}
+    while len(out) < limit:
+        progressed = False
+        for k in keys:
+            if len(out) >= limit:
+                break
+            i = idx[k]
+            if i < len(buckets[k]):
+                out.append(buckets[k][i])
+                idx[k] = i + 1
+                progressed = True
+        if not progressed:
+            break
+    remainder = {k: buckets[k][idx[k] :] for k in keys}
+    return out, remainder
+
+
+def _flatten_buckets_merge_order(
+    buckets: dict[str, list[dict[str, Any]]],
+    selected: set[str],
+) -> list[dict[str, Any]]:
+    """将各平台桶按固定顺序串联，供下一轮全局去重/排序（与爬虫原始 extend 顺序对齐）。"""
+    order = [k for k in _MERGE_PLATFORM_SLUG_ORDER if k in selected]
+    out: list[dict[str, Any]] = []
+    for k in order:
+        out.extend(buckets.get(k) or [])
+    return out
+
+
+def _balanced_window_and_remainder_buckets(
+    acc: list[dict[str, Any]],
+    selected: set[str],
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """全局去重/排序后的扁平列表 → 分桶 → 轮询取一页；单平台时等价于顺序切片。"""
+    if len(selected) < 2:
+        win = acc[:limit]
+        rest_flat = acc[len(win) :]
+        return win, _split_rows_by_platform_slug(rest_flat, selected)
+    buckets = _split_rows_by_platform_slug(acc, selected)
+    return _interleave_round_robin_take(buckets, limit=limit)
+
+
+def _encode_next_page_token(next_page: int, scope_sig: str, sid_norm: str) -> str:
+    payload = {"v": 1, "p": int(next_page), "sc": scope_sig, "si": sid_norm}
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
 def filter_results_by_condition(rows: list[dict[str, Any]], condition: str) -> list[dict[str, Any]]:
     """
     合并去重后的成色过滤：``new`` → 仅 ``全新``；``used`` → 仅 ``二手``；``all`` 不变。
@@ -2109,6 +2202,74 @@ _SEARCH_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # 多平台合并搜索：单平台任务墙钟上限（秒）；超时则该平台本轮视为空，其它平台照常返回
 SEARCH_PLATFORM_FETCH_TIMEOUT_SEC = 3.0
+
+# 合并搜索：对称「下一平台页码」游标 + 去重/成色过滤后的 remainder（跨 HTTP 请求）
+SEARCH_STREAM_TTL_SEC = 600.0
+SEARCH_STREAM_MAX_KEYS = 4096
+_SEARCH_STREAM_LOCK = threading.Lock()
+_UNIFIED_STREAM_CURSORS: dict[str, tuple[float, "_UnifiedStreamCursor"]] = {}
+# 单次请求内并行预取的平台连续页数（asyncio.gather）
+SEARCH_PARALLEL_PLATFORM_PAGES = 3
+# 去重/成色过滤后仍不足一页时，最多追加的合并轮数（每轮最多 SEARCH_PARALLEL_PLATFORM_PAGES 个平台页）
+SEARCH_MERGE_MAX_ROUNDS = 60
+
+
+@dataclass
+class _UnifiedStreamCursor:
+    """多站对称分页：各平台共用下一个待抓取的 1-based 页码；remainder 按平台分桶（平衡分发剩余尾量）。"""
+
+    remainder_buckets: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    next_platform_page: int = 1
+    last_unified_page_served: int = 0
+
+
+def _unified_stream_storage_key(scope_sig: str, sid_norm: str) -> str:
+    return f"{scope_sig}:{sid_norm or '__nosid__'}"
+
+
+def _prune_unified_stream_unlocked(now: float) -> None:
+    global _UNIFIED_STREAM_CURSORS
+    if len(_UNIFIED_STREAM_CURSORS) > SEARCH_STREAM_MAX_KEYS:
+        drop_n = len(_UNIFIED_STREAM_CURSORS) - SEARCH_STREAM_MAX_KEYS // 2
+        for key, _ in sorted(
+            _UNIFIED_STREAM_CURSORS.items(),
+            key=lambda kv: kv[1][0],
+        )[: max(0, drop_n)]:
+            _UNIFIED_STREAM_CURSORS.pop(key, None)
+    expired = [
+        k
+        for k, (ts, _) in _UNIFIED_STREAM_CURSORS.items()
+        if now - ts > SEARCH_STREAM_TTL_SEC
+    ]
+    for k in expired:
+        _UNIFIED_STREAM_CURSORS.pop(k, None)
+
+
+def _get_unified_stream_cursor(key: str) -> _UnifiedStreamCursor | None:
+    now = time.monotonic()
+    with _SEARCH_STREAM_LOCK:
+        _prune_unified_stream_unlocked(now)
+        ent = _UNIFIED_STREAM_CURSORS.get(key)
+        if not ent:
+            return None
+        ts, cur = ent
+        if now - ts > SEARCH_STREAM_TTL_SEC:
+            _UNIFIED_STREAM_CURSORS.pop(key, None)
+            return None
+        return cur
+
+
+def _put_unified_stream_cursor(key: str, cur: _UnifiedStreamCursor) -> None:
+    now = time.monotonic()
+    with _SEARCH_STREAM_LOCK:
+        _prune_unified_stream_unlocked(now)
+        _UNIFIED_STREAM_CURSORS[key] = (now, cur)
+
+
+def _reset_unified_stream_cursor(key: str) -> _UnifiedStreamCursor:
+    fresh = _UnifiedStreamCursor(remainder_buckets={}, next_platform_page=1, last_unified_page_served=0)
+    _put_unified_stream_cursor(key, fresh)
+    return fresh
 
 
 def _search_result_cache_key(
@@ -2481,52 +2642,135 @@ async def _merge_search_single_round(
     return results, has_more
 
 
+async def _accumulate_merge_pages_until_full(
+    q_clean: str,
+    selected: set[str],
+    cond_norm: str,
+    sort_norm: str,
+    *,
+    unified_page_no: int,
+    seed_rows: list[dict[str, Any]],
+    start_fp: int,
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """
+    用 ``asyncio.gather`` 并行抓取连续多页平台结果，经去重 /（前几页）全局排序后，
+    凑满 ``SEARCH_RESULTS_PAGE_SIZE`` 或各站均无更多为止。
+    返回 ``(accumulated, next_platform_page, has_more_platform_data)``。
+    """
+    acc = list(seed_rows)
+    acc = _dedupe_results_preserve_order(acc)
+    sort_global = (
+        unified_page_no < SEARCH_FAST_STREAM_PAGE_THRESHOLD
+        and sort_norm in ("relevance", "price_desc", "price_asc")
+        and not (len(selected) == 1 and sort_norm == "relevance" and selected == {"reverb"})
+    )
+    if sort_global:
+        acc = sort_unified_search_rows(acc, sort_norm, q_clean)
+
+    fp = max(1, int(start_fp))
+    if len(acc) >= SEARCH_RESULTS_PAGE_SIZE:
+        # 仍有尾部 remainder：未发起新一轮平台请求，下一页必须从 start_fp 继续
+        return acc, fp, len(acc) > SEARCH_RESULTS_PAGE_SIZE
+
+    rounds = 0
+    last_batch_any_more = False
+
+    while len(acc) < SEARCH_RESULTS_PAGE_SIZE and rounds < SEARCH_MERGE_MAX_ROUNDS:
+        pages = [fp + i for i in range(SEARCH_PARALLEL_PLATFORM_PAGES)]
+        gathered = await asyncio.gather(
+            *[
+                _merge_search_single_round(
+                    q_clean,
+                    pg,
+                    selected,
+                    cond_norm,
+                    sort_norm,
+                    requested_page=unified_page_no,
+                )
+                for pg in pages
+            ]
+        )
+        batch_still_more = False
+        for idx, ((chunk, hm), pg) in enumerate(zip(gathered, pages)):
+            batch_still_more = batch_still_more or hm
+            acc.extend(chunk)
+            acc = _dedupe_results_preserve_order(acc)
+            if sort_global:
+                acc = sort_unified_search_rows(acc, sort_norm, q_clean)
+            if len(acc) >= SEARCH_RESULTS_PAGE_SIZE:
+                later_in_gather = any(gathered[j][1] for j in range(idx + 1, len(gathered)))
+                next_fp = pg + 1
+                more_out = bool(
+                    len(acc) > SEARCH_RESULTS_PAGE_SIZE or later_in_gather or hm
+                )
+                return acc, next_fp, more_out
+        fp += SEARCH_PARALLEL_PLATFORM_PAGES
+        last_batch_any_more = batch_still_more
+        rounds += 1
+        if not batch_still_more:
+            break
+
+    more_out = len(acc) > SEARCH_RESULTS_PAGE_SIZE or last_batch_any_more
+    return acc, fp, more_out
+
+
 async def _run_global_search(
     q_clean: str,
     page_no: int,
     selected: set[str],
     cond_norm: str,
     sort_norm: str,
+    *,
+    stream_key: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """
-    统一分页：
+    统一分页（对称平台页游标 + 超量抓取）：
 
-    - **仅选一个平台**：只请求该平台第 ``page_no`` 页（第三方已按 ``sort`` 排序，必要时服务端再排一次）。
-    - **多平台**：并发各站第 ``page_no`` 页后，按固定顺序 **extend** 合并 → 去重 → 成色过滤 → 截断。
-      第 1–2 页：``price_*`` 仍对本批合并结果做一次全局排序；自第 ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 页起
-      **不再**跨平台重排，直接保留各站 API 顺序（仅依赖各站自身 ``sort``）。
+    - 进程内按 ``stream_key`` 记录各轮合并后的 **remainder** 与 **下一平台页码**（多站共用对称页码）。
+    - 单次响应内并行请求连续平台页（``SEARCH_PARALLEL_PLATFORM_PAGES``），直到去重/成色过滤后
+      凑满 ``SEARCH_RESULTS_PAGE_SIZE`` 或各站用尽。
+    - 多平台时对扁平结果做 **分桶 + 轮询**，尽量让每页包含多平台条目（某站无货时由其它站补齐）。
+    - 第 1–2 个「用户页」仍可对累积结果做全局排序（与 ``SEARCH_FAST_STREAM_PAGE_THRESHOLD`` 一致）。
     """
-    if len(selected) == 1:
-        rows, hm = await _merge_search_single_round(
-            q_clean,
-            page_no,
-            selected,
-            cond_norm,
-            sort_norm,
-            requested_page=page_no,
-        )
-        # 仅 Reverb 时「相关度」已由接口 ``order=relevance`` 排序，不再用标题词频覆盖。
-        if sort_norm == "relevance" and selected == {"reverb"}:
-            return rows, hm
-        rows = sort_unified_search_rows(rows, sort_norm, q_clean)
-        return rows, hm
+    pg_u = max(1, int(page_no))
 
-    batch, hm = await _merge_search_single_round(
+    if pg_u == 1:
+        _reset_unified_stream_cursor(stream_key)
+        seed: list[dict[str, Any]] = []
+        start_fp = 1
+    else:
+        loaded = _get_unified_stream_cursor(stream_key)
+        if loaded is not None and loaded.last_unified_page_served == pg_u - 1:
+            seed = _flatten_buckets_merge_order(loaded.remainder_buckets, selected)
+            start_fp = loaded.next_platform_page
+        else:
+            seed = []
+            start_fp = pg_u
+
+    acc, next_fp, more_chunks = await _accumulate_merge_pages_until_full(
         q_clean,
-        page_no,
         selected,
         cond_norm,
         sort_norm,
-        requested_page=page_no,
+        unified_page_no=pg_u,
+        seed_rows=seed,
+        start_fp=start_fp,
     )
-    if (
-        sort_norm in ("price_desc", "price_asc")
-        and page_no < SEARCH_FAST_STREAM_PAGE_THRESHOLD
-    ):
-        batch = sort_unified_search_rows(batch, sort_norm, q_clean)
-    overflow = len(batch) > SEARCH_PAGE_SIZE
-    window = batch[:SEARCH_PAGE_SIZE]
-    has_more = hm or overflow
+
+    window, remainder_buckets = _balanced_window_and_remainder_buckets(
+        acc, selected, SEARCH_RESULTS_PAGE_SIZE
+    )
+    has_more = any(remainder_buckets.get(s) for s in selected) or more_chunks
+
+    _put_unified_stream_cursor(
+        stream_key,
+        _UnifiedStreamCursor(
+            remainder_buckets=remainder_buckets,
+            next_platform_page=next_fp,
+            last_unified_page_served=pg_u,
+        ),
+    )
+
     return window, has_more
 
 
@@ -2539,10 +2783,16 @@ async def _api_search_collect_page(
     sort_norm: str,
     sid_norm: str,
     scope_sig: str,
+    stream_key: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """单页聚合 + Reverb 跨页会话过滤。"""
     results, has_more = await _run_global_search(
-        q_clean, page_no, selected, cond_norm, sort_norm
+        q_clean,
+        page_no,
+        selected,
+        cond_norm,
+        sort_norm,
+        stream_key=stream_key,
     )
     results = _apply_reverb_cross_page_session_filter(
         results,
@@ -2575,7 +2825,8 @@ async def api_search(
         "relevance",
         description=(
             "排序：``relevance``（默认）| ``price_desc`` | ``price_asc``；"
-            "多站时各平台仅请求当前 ``page``；``price_*`` 在第 1–2 页对本页合并结果排序，第 3 页起不做跨平台全局重排"
+            "多站时在进程内维护对称平台页游标并可并行抓取后续平台页直至凑满一页；"
+            "``price_*`` 在第 1–2 页对本页合并结果排序，第 3 页起不做跨平台全局重排"
         ),
     ),
     session_id: str = Query(
@@ -2590,7 +2841,7 @@ async def api_search(
     """
     按需 ``asyncio.gather``：仅将 ``platforms`` 勾选的任务加入并发池（未选平台不发起网络请求）。
 
-    性能：各平台第 ``page`` 路并发；每路 ``asyncio.wait_for`` **3s** 封顶，超时该平台本轮为空。
+    性能：同一用户页内可 ``asyncio.gather`` 并行多段连续平台页；每平台任务 ``asyncio.wait_for`` **3s** 封顶，超时该平台该段为空。
     汇率仅在内存读取。已登录时仅对**当前页商品 URL** 做一条 ``IN`` 查询填充 ``is_favorited``。
 
     Digimart：``condition=new|used`` 时先在请求上加 ``productTypes``（新品/中古），再解析列表；
@@ -2618,7 +2869,9 @@ async def api_search(
     _empty_list: dict[str, Any] = {
         "items": [],
         "page": 1,
+        "current_page": 1,
         "has_more": False,
+        "next_page_token": "",
         "query": "",
         "sort": sort_norm,
         "results": [],
@@ -2656,6 +2909,8 @@ async def api_search(
             current_user.id if current_user else None,
         )
 
+        stream_key = _unified_stream_storage_key(scope_sig, sid_norm)
+
         page_kw = dict(
             q_clean=q_clean,
             selected=selected,
@@ -2663,6 +2918,7 @@ async def api_search(
             sort_norm=sort_norm,
             sid_norm=sid_norm,
             scope_sig=scope_sig,
+            stream_key=stream_key,
         )
 
         cache_key = _search_result_cache_key(
@@ -2690,6 +2946,29 @@ async def api_search(
             has_more = bool(cached_snapshot["has_more"])
             effective_page = int(cached_snapshot["effective_page"])
             page_adjusted = bool(cached_snapshot["page_adjusted"])
+            if page_no == 1:
+                snap = cached_snapshot.get("stream_snapshot")
+                if isinstance(snap, dict):
+                    rb = snap.get("remainder_buckets")
+                    if isinstance(rb, dict):
+                        remainder_buckets = copy.deepcopy(rb)
+                    elif snap.get("remainder"):
+                        remainder_buckets = _split_rows_by_platform_slug(
+                            copy.deepcopy(snap["remainder"]),
+                            selected,
+                        )
+                    else:
+                        remainder_buckets = {}
+                    _put_unified_stream_cursor(
+                        stream_key,
+                        _UnifiedStreamCursor(
+                            remainder_buckets=remainder_buckets,
+                            next_platform_page=int(snap.get("next_platform_page") or 1),
+                            last_unified_page_served=int(
+                                snap.get("last_unified_page_served") or 0
+                            ),
+                        ),
+                    )
         else:
             results, has_more = await _api_search_collect_page(page_no=page_no, **page_kw)
 
@@ -2710,16 +2989,29 @@ async def api_search(
                         )
                         break
 
+            cache_payload: dict[str, Any] = {
+                "results_rows": copy.deepcopy(results),
+                "has_more": has_more,
+                "effective_page": effective_page,
+                "page_adjusted": page_adjusted,
+                "current_page": effective_page,
+                "next_page_token": (
+                    _encode_next_page_token(effective_page + 1, scope_sig, sid_norm)
+                    if has_more
+                    else ""
+                ),
+            }
+            if page_no == 1:
+                cur_snap = _get_unified_stream_cursor(stream_key)
+                if cur_snap is not None:
+                    cache_payload["stream_snapshot"] = {
+                        "remainder_buckets": copy.deepcopy(cur_snap.remainder_buckets),
+                        "next_platform_page": cur_snap.next_platform_page,
+                        "last_unified_page_served": cur_snap.last_unified_page_served,
+                    }
+
             with _SEARCH_CACHE_LOCK:
-                _search_cache_put_unlocked(
-                    cache_key,
-                    {
-                        "results_rows": copy.deepcopy(results),
-                        "has_more": has_more,
-                        "effective_page": effective_page,
-                        "page_adjusted": page_adjusted,
-                    },
-                )
+                _search_cache_put_unlocked(cache_key, cache_payload)
 
         if current_user is not None:
             norm_keys = [
@@ -2737,10 +3029,18 @@ async def api_search(
         compact_rows = [_compact_search_api_item(r) for r in results]
         n = len(compact_rows)
 
+        token_out = ""
+        if cached_snapshot is not None:
+            token_out = str(cached_snapshot.get("next_page_token") or "")
+        if has_more and not token_out:
+            token_out = _encode_next_page_token(effective_page + 1, scope_sig, sid_norm)
+
         payload: dict[str, Any] = {
             "items": compact_rows,
             "page": effective_page,
+            "current_page": effective_page,
             "has_more": has_more,
+            "next_page_token": token_out,
             "query": q_clean,
             "sort": sort_norm,
             "results": compact_rows,
@@ -2761,7 +3061,9 @@ async def api_search(
         return {
             "items": [],
             "page": page_no,
+            "current_page": page_no,
             "has_more": False,
+            "next_page_token": "",
             "query": q_clean,
             "sort": sort_norm,
             "results": [],
